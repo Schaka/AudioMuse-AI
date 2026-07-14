@@ -75,5 +75,7 @@ testing_suite/
 analysis.md
 .claude/settings.local.json
 .claude/settings.local.json
+.claude/.headroom_wrap_marker.json
+.tokensave
 lyrics_model_gte_vnni.tar.gz
 native-build/windows/vendor/redis/amd64/redis-server.exe

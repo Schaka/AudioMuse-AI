@@ -169,6 +169,7 @@ class PluginContext:
         self.cron_tasks = {}
         self.tasks = {}
         self.onnx_providers = []
+        self.analysis_providers = {}
         self.flask_start = []
         self.worker_start = []
         self.song_analyzed_hooks = []
@@ -194,8 +195,24 @@ class PluginContext:
     def add_cron_task(self, name, func, queue='default'):
         self.cron_tasks[name] = {'dotted': dotted_path(func), 'queue': queue}
 
-    def register_onnx_provider(self, name, options=None, position='before_cpu'):
-        self.onnx_providers.append({'name': name, 'options': options or {}, 'position': position})
+    def register_onnx_provider(self, name, options=None, position='before_cpu',
+                               only_models=None, exclude_models=None):
+        """Offer an extra ONNX Runtime execution provider for analysis.
+
+        By default the provider is offered to every ONNX model. Some providers
+        cannot parse every graph (for example MIGraphX handles musicnn but not
+        CLAP's Resize op or the Whisper decoder), so scope it with ``only_models``
+        or ``exclude_models``: lists of the ``label`` each model passes to
+        ``create_onnx_session`` (``musicnn``, ``clap``, ``whisper_encoder``, ...).
+        A model that does not match is left untouched and keeps its default chain.
+        """
+        self.onnx_providers.append({
+            'name': name,
+            'options': options or {},
+            'position': position,
+            'only_models': list(only_models) if only_models else None,
+            'exclude_models': list(exclude_models) if exclude_models else None,
+        })
 
     def on_flask_start(self, func):
         self.flask_start.append(func)
@@ -218,9 +235,18 @@ class PluginContext:
     def on_install(self, func):
         self.install_hooks.append(func)
 
-    def register_analysis_provider(self, *args, **kwargs):
-        logger.info(
-            'Plugin %s called register_analysis_provider; alternative analysis models '
-            'are a forward seam and are not wired in this version.',
-            self.plugin_id,
-        )
+    def register_analysis_provider(self, component, factory):
+        """Replace a whole analysis component with a plugin-supplied implementation.
+
+        Some accelerators need more than a different ONNX execution provider: they
+        need a different library entirely. MIGraphX, for instance, cannot run the
+        ONNX Whisper decoder at all, so an AMD plugin swaps in faster-whisper.
+
+        ``component`` names the step to replace (currently ``asr``). ``factory`` is
+        the replacement module/object, or a zero-arg callable returning one. It must
+        match the built-in module's public surface; for ``asr`` that is
+        ``load_whisper_model()``, ``transcribe(wav, sr, language=None)``,
+        ``is_loaded()`` and ``unload()``. Core consults the registered provider
+        first and falls back to the built-in when no plugin registered one.
+        """
+        self.analysis_providers[component] = factory

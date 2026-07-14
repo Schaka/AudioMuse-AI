@@ -1,0 +1,147 @@
+# AudioMuse-AI - AMD ROCm (MIGraphX) PLUGIN local build + test compose.
+#
+# Builds Dockerfile-rocm (core + plugin seams, no baked AMD code) and passes an
+# AMD GPU to the worker. The AMD behaviour is added at runtime by the ROCm
+# Accelerator plugin, served here by the `plugin-catalog` sidecar so you can
+# install it from the Plugins UI.
+#
+# Prereqs: ROCm 7.x kernel driver (amdgpu), host user in `render`/`video` groups.
+#
+# Usage (from repo root):
+#   docker compose -f deployment/docker-compose-rocm.yaml up --build
+#
+# Then, in the web UI (http://localhost:8000):
+#   1. Log in as admin, open Plugins > Repositories.
+#   2. Add repository:  http://plugin-catalog:8099/manifest.json
+#   3. Catalog tab > install "ROCm Accelerator (AMD)" > Apply now (restart).
+#   4. Start an analysis. Worker logs should show the MIGraphX ONNX provider
+#      chain for musicnn and faster-whisper for lyrics; confirm GPU use with
+#      `rocm-smi` on the host.
+
+x-rocm-build: &rocm-build
+  context: ..
+  dockerfile: Dockerfile-rocm
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: audiomuse-redis
+    environment:
+      TZ: "${TZ:-UTC}"
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: audiomuse-postgres
+    environment:
+      TZ: "${TZ:-UTC}"
+      POSTGRES_USER: ${POSTGRES_USER:-audiomuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-audiomusepassword}
+      POSTGRES_DB: "audiomusedb"
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
+
+  # Serves a local plugin catalog derived from plugin-reference/rocm_accelerator
+  # so the plugin can be installed from the UI without a public repository.
+  plugin-catalog:
+    image: python:3.12-alpine
+    container_name: audiomuse-plugin-catalog
+    working_dir: /src
+    volumes:
+      - ..:/src:ro
+    command:
+      - sh
+      - -ec
+      - |
+        mkdir -p /catalog
+        cd /src/plugin-reference/rocm_accelerator
+        python -m zipfile -c /catalog/rocm_accelerator.zip __init__.py whisper_faster.py README.md
+        python -c "import json; d=json.load(open('/src/plugin-reference/rocm_accelerator/plugin.json')); b='http://plugin-catalog:8099'; d['versions'][0]['sourceUrl']=b+'/rocm_accelerator.zip'; json.dump(d,open('/catalog/plugin.json','w')); m={'plugins':[{'id':d['id'],'name':d['name'],'author':d['author'],'description':d['description'],'pluginUrl':b+'/plugin.json'}]}; json.dump(m,open('/catalog/manifest.json','w'))"
+        cd /catalog
+        exec python -m http.server 8099
+    restart: unless-stopped
+
+  audiomuse-ai-flask:
+    build: *rocm-build
+    image: audiomuse-ai-rocm:local
+    container_name: audiomuse-ai-flask-rocm
+    ports:
+      - "${FRONTEND_PORT:-8000}:8000"
+    environment:
+      SERVICE_TYPE: "flask"
+      TZ: "${TZ:-UTC}"
+      POSTGRES_USER: ${POSTGRES_USER:-audiomuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-audiomusepassword}
+      POSTGRES_DB: "audiomusedb"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_PORT: "5432"
+      REDIS_URL: "redis://redis:6379/0"
+      TEMP_DIR: "/app/temp_audio"
+    volumes:
+      - temp-audio-flask:/app/temp_audio
+      - plugins-flask:/app/plugin/installed
+    depends_on:
+      - redis
+      - postgres
+      - plugin-catalog
+    restart: unless-stopped
+
+  audiomuse-ai-worker:
+    build: *rocm-build
+    image: audiomuse-ai-rocm:local
+    container_name: audiomuse-ai-worker-rocm
+    environment:
+      SERVICE_TYPE: "worker"
+      TZ: "${TZ:-UTC}"
+      POSTGRES_USER: ${POSTGRES_USER:-audiomuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-audiomusepassword}
+      POSTGRES_DB: "audiomusedb"
+      POSTGRES_HOST: "postgres"
+      POSTGRES_PORT: "5432"
+      REDIS_URL: "redis://redis:6379/0"
+      TEMP_DIR: "/app/temp_audio"
+      # cuML has no ROCm port; GPU clustering stays CPU. ONNX analysis uses the GPU.
+      USE_GPU_CLUSTERING: "false"
+      # Uncomment to pin to a specific AMD GPU (index or UUID):
+      # HIP_VISIBLE_DEVICES: "0"
+    # --- AMD GPU passthrough ---
+    devices:
+      - /dev/kfd
+      - /dev/dri
+    # Base image has no `render` group; pass host's numeric GIDs instead.
+    # Find yours with: getent group render video
+    group_add:
+      - "${RENDER_GID:-105}"
+      - "${VIDEO_GID:-39}"
+    security_opt:
+      - seccomp:unconfined
+    ipc: host
+    cap_add:
+      - SYS_PTRACE
+    volumes:
+      - temp-audio-worker:/app/temp_audio
+      - plugins-worker:/app/plugin/installed
+      # Persist the MIOpen kernel cache so GPU kernels are not recompiled on every
+      # restart (matches MIOPEN_CUSTOM_CACHE_DIR baked into Dockerfile-rocm).
+      - miopen-cache:/app/.cache/miopen
+    depends_on:
+      - redis
+      - postgres
+      - plugin-catalog
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  postgres-data:
+  temp-audio-flask:
+  temp-audio-worker:
+  plugins-flask:
+  plugins-worker:
+  miopen-cache:
