@@ -27,13 +27,14 @@ import time
 
 from tasks.song_alchemy import song_alchemy
 from app_helper import attach_song_features
+import app_server_context
 import config
 
 logger = logging.getLogger(__name__)
 
 alchemy_bp = Blueprint('alchemy_bp', __name__, template_folder='../templates')
 
-_PLAYLIST_CACHE = {'ts': 0.0, 'data': None}
+_PLAYLIST_CACHE = {}
 _PLAYLIST_CACHE_TTL = 30.0
 _PLAYLIST_CACHE_LOCK = threading.Lock()
 
@@ -99,29 +100,40 @@ def search_artists():
     offset = start
 
     try:
-        results = search_artists_by_name(query, limit=limit, offset=offset)
+        server_id, include_legacy = app_server_context.selected_server_scope()
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
+    try:
+        results = search_artists_by_name(
+            query,
+            limit=limit,
+            offset=offset,
+            server_id=server_id,
+            include_legacy_default=include_legacy,
+        )
+        results = app_server_context.scope_artist_results(results)
         return jsonify(results)
     except Exception:
         logger.exception("Artist search failed")
         return jsonify([]), 200  # Return empty list on error
 
 
-def _cached_all_playlists():
+def _cached_all_playlists(server_id):
+    cache_key = server_id or '__default__'
     now = time.monotonic()
-    if _PLAYLIST_CACHE['data'] is not None and (now - _PLAYLIST_CACHE['ts']) < _PLAYLIST_CACHE_TTL:
-        return _PLAYLIST_CACHE['data']
+    cached = _PLAYLIST_CACHE.get(cache_key)
+    if cached is not None and (now - cached['ts']) < _PLAYLIST_CACHE_TTL:
+        return cached['data']
     with _PLAYLIST_CACHE_LOCK:
         now = time.monotonic()
-        if (
-            _PLAYLIST_CACHE['data'] is not None
-            and (now - _PLAYLIST_CACHE['ts']) < _PLAYLIST_CACHE_TTL
-        ):
-            return _PLAYLIST_CACHE['data']
+        cached = _PLAYLIST_CACHE.get(cache_key)
+        if cached is not None and (now - cached['ts']) < _PLAYLIST_CACHE_TTL:
+            return cached['data']
         from tasks.mediaserver import get_all_playlists
 
         data = get_all_playlists() or []
-        _PLAYLIST_CACHE['data'] = data
-        _PLAYLIST_CACHE['ts'] = now
+        _PLAYLIST_CACHE[cache_key] = {'data': data, 'ts': now}
         return data
 
 
@@ -144,7 +156,11 @@ def search_playlists():
     """
     query = (request.args.get('query', '') or '').strip().lower()
     try:
-        playlists = _cached_all_playlists()
+        with app_server_context.use_request_server() as server_id:
+            playlists = _cached_all_playlists(server_id)
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
     except Exception:
         logger.exception("Playlist search failed")
         return jsonify([]), 200
@@ -215,6 +231,11 @@ def alchemy_api():
         description: Internal error.
     """
     payload = request.get_json() or {}
+    try:
+        app_server_context.resolve_request_server_id(payload)
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
     items = payload.get('items', [])
     try:
         n = int(payload.get('n', config.ALCHEMY_DEFAULT_N_RESULTS))
@@ -236,17 +257,76 @@ def alchemy_api():
         if i.get('op', '').upper() == 'SUBTRACT' and i.get('id')
     ]
 
+    # Song seeds may arrive as the selected server's provider ids; canonicalize
+    # them before they reach the shared index (canonical ids pass through).
+    seed_ids = [
+        entry['id'] for entry in add_items + subtract_items
+        if entry.get('type', 'song') == 'song'
+    ]
+    resolved_seed_ids = app_server_context.resolve_input_item_ids(seed_ids, payload)
+    for entry in add_items + subtract_items:
+        if entry.get('type', 'song') == 'song':
+            entry['id'] = resolved_seed_ids.get(str(entry['id']), entry['id'])
+
+    # Artist IDs are provider-specific too. The shared artist index is keyed by
+    # normalized artist name, so resolve selected-server IDs before querying it.
+    for entry in add_items + subtract_items:
+        if entry.get('type') == 'artist':
+            entry['id'] = app_server_context.resolve_artist_identifier(entry['id'], payload)
+
     # Allow optional override for subtract distance (from frontend slider)
     subtract_distance = payload.get('subtract_distance')
     try:
-        results = song_alchemy(
-            add_items=add_items,
-            subtract_items=subtract_items,
-            n_results=n,
-            subtract_distance=subtract_distance,
-            temperature=temperature,
-        )
+        with app_server_context.use_request_server(payload):
+            results = song_alchemy(
+                add_items=add_items,
+                subtract_items=subtract_items,
+                n_results=n,
+                subtract_distance=subtract_distance,
+                temperature=temperature,
+            )
         attach_song_features(results.get('results'))
+        # Translate every song id in the response with ONE registry round-trip: the
+        # main results, the filtered_out set, and the song-type add/sub points all
+        # resolve to the selected server's provider ids from a single mapping (the
+        # rest of add/sub points are synthetic anchor/mood/artist/playlist markers).
+        result_rows = results.get('results') or []
+        filtered_rows = results.get('filtered_out') or []
+        song_points = [
+            point
+            for key in ('add_points', 'sub_points')
+            for point in (results.get(key) or [])
+            if point.get('type') == 'song'
+        ]
+        all_ids = [
+            row['item_id']
+            for row in (result_rows + filtered_rows + song_points)
+            if row.get('item_id')
+        ]
+        mapping = app_server_context.translate_ids_for_request(all_ids)
+
+        def _translate_song_rows(rows):
+            kept = []
+            for row in rows:
+                provider_id = mapping.get(str(row.get('item_id')))
+                if provider_id is None:
+                    continue
+                row['item_id'] = provider_id
+                kept.append(row)
+            return kept
+
+        results['results'] = _translate_song_rows(result_rows)[:n]
+        results['filtered_out'] = _translate_song_rows(filtered_rows)
+        for key in ('add_points', 'sub_points'):
+            kept_points = []
+            for point in results.get(key) or []:
+                if point.get('type') == 'song':
+                    provider_id = mapping.get(str(point.get('item_id')))
+                    if provider_id is None:
+                        continue
+                    point['item_id'] = provider_id
+                kept_points.append(point)
+            results[key] = kept_points
         # Keep full centroid in response for client-side save action, but not in anchor list endpoint.
         return jsonify(results)
     except ValueError:
@@ -718,6 +798,13 @@ def artist_projections_api():
         description: Failure to read cache.
     """
     from database import ARTIST_PROJECTION_CACHE
+    from tasks.mediaserver import registry
+
+    try:
+        server_id = app_server_context.resolve_request_server_id()
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
 
     try:
         if not ARTIST_PROJECTION_CACHE:
@@ -729,13 +816,25 @@ def artist_projections_api():
         if projection is None or len(component_map) == 0:
             return jsonify({'components': [], 'count': 0})
 
+        # The cache stores the legacy/default artist_id; expose the selected
+        # server's provider artist id instead, falling back to the artist NAME
+        # (a safe, non-internal identifier the similar-artists endpoint accepts)
+        # so a node without an artist_server_map row still has a live click-through.
+        artist_names = [
+            comp_info.get('artist_name')
+            for comp_info in component_map
+            if comp_info.get('artist_name')
+        ]
+        provider_artist_ids = registry.artist_ids_for_names(artist_names, server_id)
+
         # Build response with components and their 2D projections
         components = []
         for idx, comp_info in enumerate(component_map):
             if idx < len(projection):
+                artist_name = comp_info.get('artist_name')
                 components.append(
                     {
-                        'artist_id': comp_info['artist_id'],
+                        'artist_id': (provider_artist_ids.get(artist_name) or artist_name) if artist_name else None,
                         'artist_name': comp_info.get('artist_name', comp_info['artist_id']),
                         'component_idx': comp_info['component_idx'],
                         'weight': comp_info['weight'],

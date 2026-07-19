@@ -33,6 +33,7 @@ from config import (
     DUPLICATE_DISTANCE_THRESHOLD_COSINE_LYRICS,
 )
 from app_helper import top_stratified_genre
+import app_server_context
 import numpy as np
 import math  # Import the math module
 
@@ -131,6 +132,25 @@ def _resolve_anchor_to_song_id(anchor_id, other_song_id=None, pct=100):
         return _find_nearest_song_excluding_vector(target, exclude_id=other_song_id)
 
     return _find_nearest_song_excluding_vector(centroid_vec, exclude_id=other_song_id)
+
+
+# The audio IVF index is availability-masked per server, but the SemGrove (lyrics)
+# index is not - so scope its candidates to the selected server HERE rather than
+# building a global path and dropping off-server nodes afterward. Overfetch, then
+# keep only candidates present on the selected (or default) server.
+def _server_scoped_neighbors(neighbors_fn):
+    from tasks.mediaserver import registry
+
+    server_id = app_server_context.resolve_request_server_id()
+    if server_id is None and not registry.has_secondary_servers():
+        return neighbors_fn
+
+    def scoped(query, n=100):
+        raw = neighbors_fn(query, n=max(n * 5, n + 50)) or []
+        available = registry.translate_ids([r['item_id'] for r in raw], server_id)
+        return [r for r in raw if r['item_id'] in available][:n]
+
+    return scoped
 
 
 # Create a Blueprint for the path finding routes
@@ -242,6 +262,21 @@ def find_path_endpoint():
     """
     start_song_id = request.args.get('start_song_id')
     end_song_id = request.args.get('end_song_id')
+    try:
+        app_server_context.resolve_request_server_id()
+    except ValueError:
+        logger.warning("Invalid server selection.", exc_info=True)
+        return jsonify({'error': 'Invalid server selection.'}), 400
+    try:
+        resolved_endpoints = app_server_context.resolve_input_item_ids(
+            [i for i in (start_song_id, end_song_id) if i]
+        )
+    except ValueError as exc:
+        return jsonify({'error': str(exc)}), 400
+    if start_song_id:
+        start_song_id = resolved_endpoints.get(start_song_id, start_song_id)
+    if end_song_id:
+        end_song_id = resolved_endpoints.get(end_song_id, end_song_id)
     start_mood = request.args.get('start_mood')
     end_mood = request.args.get('end_mood')
     start_anchor = request.args.get('start_anchor')
@@ -348,8 +383,8 @@ def find_path_endpoint():
                 max_steps,
                 path_fix_size=path_fix_size,
                 get_vector_fn=get_sem_grove_vector_by_id,
-                neighbors_fn=find_sem_grove_neighbors_by_vector,
-                neighbors_by_id_fn=find_sem_grove_neighbors_by_id,
+                neighbors_fn=_server_scoped_neighbors(find_sem_grove_neighbors_by_vector),
+                neighbors_by_id_fn=_server_scoped_neighbors(find_sem_grove_neighbors_by_id),
                 metric="angular",
                 dup_threshold_cosine=DUPLICATE_DISTANCE_THRESHOLD_COSINE_LYRICS,
             )
@@ -387,6 +422,8 @@ def find_path_endpoint():
             if total_distance is not None and math.isfinite(total_distance)
             else 0.0
         )
+
+        path = app_server_context.scope_results(path, None, id_key='item_id')
 
         return jsonify({"path": path, "total_distance": final_distance})
 

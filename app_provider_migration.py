@@ -28,6 +28,7 @@ import csv
 import io
 import json
 import logging
+import uuid
 
 from flask import Blueprint, jsonify, render_template, request
 from psycopg2 import sql as pgsql
@@ -35,7 +36,9 @@ from psycopg2 import sql as pgsql
 # App-level singletons (DB connection, Redis, RQ queues). Importing here keeps
 # the blueprint file self-contained - the rest of the app doesn't need to hand
 # anything in.
-from database import get_db
+from config import TASK_STATUS_PENDING, TASK_STATUS_FAILURE
+from database import get_db, get_active_main_task, save_task_status
+from tasks.provider_migration_tasks import MIGRATION_TASK_TYPE
 from taskqueue import redis_conn, rq_queue_high
 from ssrf_guard import validate_outbound_url
 from tasks.mediaserver.helper import detect_path_format as _detect_path_format
@@ -109,12 +112,25 @@ _SOURCE_PATH_SAMPLE_SIZE = 100
 
 
 def _sample_score_file_paths(limit=_SOURCE_PATH_SAMPLE_SIZE):
-    """Return up to ``limit`` ``file_path`` values from the score table."""
+    """Return up to ``limit`` source-server paths for the path-format probe.
+
+    A path belongs to a file ON A SERVER, so it lives on that server's map row,
+    not on the shared song row. A migration retires the DEFAULT provider, so it
+    is the default server's own paths whose format decides whether the wizard can
+    proceed.
+    """
+    from tasks.mediaserver import registry
+
     db = get_db()
+    default = registry.get_default_server(db)
+    default_id = default['server_id'] if default else None
+    if default_id is None:
+        return []
     with db.cursor() as cur:
         cur.execute(
-            "SELECT file_path FROM score WHERE file_path IS NOT NULL LIMIT %s",
-            (limit,),
+            "SELECT file_path FROM track_server_map "
+            "WHERE server_id = %s AND file_path IS NOT NULL LIMIT %s",
+            (default_id, limit),
         )
         rows = cur.fetchall() or []
     return [r[0] for r in rows]
@@ -301,6 +317,40 @@ def session_start():
     return jsonify({'session_id': row[0]})
 
 
+def _source_provider_id_map(canonical_ids):
+    # Map source-catalogue canonical item_ids to the default (source) server's
+    # provider ids so a migration response never exposes an internal fp_ id.
+    # Unmapped ids are omitted (fail closed); a registry error yields an empty map.
+    ids = [str(i) for i in canonical_ids if i]
+    if not ids:
+        return {}
+    from tasks.mediaserver import registry
+    try:
+        return registry.translate_ids(ids, None)
+    except Exception:
+        logger.exception("Migration source id translation failed")
+        return {}
+
+
+def _translate_state_source_ids(state):
+    # Rewrite the canonical old_id keys in a session state's manual_matches /
+    # manual_unmatches to the source server's provider ids for the API response.
+    manual_matches = state.get('manual_matches')
+    manual_unmatches = state.get('manual_unmatches')
+    ids = []
+    if isinstance(manual_matches, dict):
+        ids += list(manual_matches.keys())
+    if isinstance(manual_unmatches, list):
+        ids += manual_unmatches
+    mapping = _source_provider_id_map(ids)
+    if isinstance(manual_matches, dict):
+        state['manual_matches'] = {
+            mapping[k]: v for k, v in manual_matches.items() if k in mapping
+        }
+    if isinstance(manual_unmatches, list):
+        state['manual_unmatches'] = [mapping[i] for i in manual_unmatches if i in mapping]
+
+
 @migration_bp.route('/api/migration/session/<int:session_id>', methods=['GET'])
 def session_get(session_id):
     """
@@ -357,6 +407,8 @@ def session_get(session_id):
             state = json.loads(state)
         except Exception:
             state = {}
+    if isinstance(state, dict):
+        _translate_state_source_ids(state)
     return jsonify(
         {
             'id': _id,
@@ -1096,11 +1148,18 @@ def match_album():
         _rematch_album_rows(session_id, newly_matched, still_unmatched)
     else:
         _merge_manual_matches(session_id, newly_matched)
+    # Expose the source server's provider ids, never the internal fp_ id. The count
+    # tracks the id list exactly (both drop any id with no provider mapping) so the
+    # wizard's counter and its rendered rows never disagree.
+    unmatched_mapping = _source_provider_id_map(still_unmatched)
+    unmatched_item_ids = [
+        unmatched_mapping[i] for i in still_unmatched if i in unmatched_mapping
+    ]
     return jsonify(
         {
             'matched': len(newly_matched),
-            'unmatched': len(still_unmatched),
-            'unmatched_item_ids': still_unmatched,
+            'unmatched': len(unmatched_item_ids),
+            'unmatched_item_ids': unmatched_item_ids,
         }
     )
 
@@ -1307,8 +1366,10 @@ def execute():
     description: |
       Requires the session to be in `dry_run_ready` status. The confirmation
       phrase must equal exactly:
-      `I want to migrate to <target_type> and delete unmatched tracks`.
-      The job rewrites every score row's `item_id` and then deletes orphans.
+      `I want to migrate to <target_type> and unbind unmatched tracks`.
+      The job only repoints the default server's `track_server_map` rows at the new
+      provider. The catalogue is never touched: no song, embedding or canonical id is
+      deleted. Unmatched songs are simply unbound from this server.
     requestBody:
       required: true
       content:
@@ -1360,7 +1421,7 @@ def execute():
         return jsonify({'error': 'session not found'}), 404
     target_type, status = row[0], row[1]
 
-    expected = f"I want to migrate to {target_type} and delete unmatched tracks"
+    expected = f"I want to migrate to {target_type} and unbind unmatched tracks"
     if confirmation_text != expected:
         return jsonify(
             {'error': f'Confirmation text does not match. Expected exactly: "{expected}"'}
@@ -1373,14 +1434,41 @@ def execute():
             }
         ), 400
 
-    # Enqueue the execute job
-    from rq.job import Job  # noqa: F401  (used by enqueue internals)
+    # The migration DELETEs orphan score rows, drops the embedding FKs and rewrites
+    # every item_id. Nothing may be writing the catalogue while it does, and a sweep
+    # counts: it writes track_server_map, which the migration is busy repointing.
+    active = get_active_main_task(exclude_task_types=())
+    if active:
+        return jsonify(
+            {
+                'error': 'Another task is running. Wait for it to finish before migrating.',
+                'task_id': active['task_id'],
+                'task_type': active['task_type'],
+                'status': active['status'],
+            }
+        ), 409
 
-    job = rq_queue_high.enqueue(
-        'tasks.provider_migration_tasks.execute_provider_migration',
-        session_id,
-        job_timeout=3600,
+    job_id = str(uuid.uuid4())
+    save_task_status(
+        job_id,
+        MIGRATION_TASK_TYPE,
+        TASK_STATUS_PENDING,
+        details={'message': 'Provider migration enqueued.'},
     )
+    try:
+        job = rq_queue_high.enqueue(
+            'tasks.provider_migration_tasks.execute_provider_migration',
+            session_id,
+            job_id=job_id,
+            job_timeout=-1,
+        )
+    except Exception:
+        logger.exception("Could not enqueue the provider migration")
+        save_task_status(
+            job_id, MIGRATION_TASK_TYPE, TASK_STATUS_FAILURE,
+            details={'error': 'Could not enqueue the task (is Redis reachable?)'},
+        )
+        return jsonify({'error': 'Could not enqueue the migration. Check the logs.'}), 500
     # Persist the RQ task id on the session so a page refresh can resume
     # polling this job rather than losing track of it.
     try:
@@ -1548,6 +1636,22 @@ def dry_run_report(session_id):
 
     old_rows = _load_score_rows_as_dicts()
 
+    # The old_id column carries the source server's provider id. An internal fp_ id
+    # must never reach ANY response - this is an authenticated GET like any other -
+    # so a source row with no provider mapping gets a BLANK old_id (fail closed)
+    # rather than its raw canonical id. A GENUINE translation error 503s here (so a
+    # transient DB hiccup does not silently blank every row with no admin signal);
+    # only a truly unmapped row blanks, its other columns (path/artist/album/track,
+    # any of which may itself be empty) the best remaining hint.
+    from tasks.mediaserver import registry
+    try:
+        old_id_provider_map = registry.translate_ids(
+            [str(old['item_id']) for old in old_rows if old.get('item_id')], None
+        )
+    except Exception:
+        logger.exception("Dry-run report source id translation failed")
+        return jsonify({'error': 'Report generation failed; retry shortly.'}), 503
+
     buf = io.StringIO()
     writer = csv.writer(buf)
     writer.writerow(
@@ -1579,7 +1683,7 @@ def dry_run_report(session_id):
             source = 'orphan'
         writer.writerow(
             [
-                old_id,
+                old_id_provider_map.get(old_id, ''),
                 old.get('author') or old.get('album_artist') or '',
                 old.get('album') or '',
                 old.get('album_artist') or '',
@@ -1740,12 +1844,41 @@ def _row_to_score_dict(r):
 
 _SCORE_COL_NAMES = ("item_id", "file_path", "title", "author", "album", "album_artist")
 _SCORE_COLS = pgsql.SQL(", ").join(pgsql.Identifier(c) for c in _SCORE_COL_NAMES)
+_SCORE_COLS_QUALIFIED = pgsql.SQL(", ").join(
+    pgsql.SQL("{}.{}").format(pgsql.Identifier("s"), pgsql.Identifier(c))
+    for c in _SCORE_COL_NAMES
+)
 
 
 def _load_score_rows_as_dicts():
+    """Score rows the migration may repoint: the DEFAULT server's catalogue only.
+
+    ``score`` is the union of every server's library, but a migration retires ONE
+    provider - the default. Rows that live only on a secondary server must never
+    enter the mapping, and must never be classed as orphans by the execute
+    transaction. ``include_legacy_default`` is True so a pre-canonicalization
+    install (whose ids are still provider-keyed and carry no map row) stays in
+    scope rather than orphaning itself.
+    """
+    from tasks.mediaserver import registry
+
     db = get_db()
+    default = registry.get_default_server(db)
+    default_id = default['server_id'] if default else None
+    if default_id is None:
+        with db.cursor() as cur:
+            cur.execute(pgsql.SQL("SELECT {} FROM score").format(_SCORE_COLS))
+            rows = cur.fetchall() or []
+        return [_row_to_score_dict(r) for r in rows]
     with db.cursor() as cur:
-        cur.execute(pgsql.SQL("SELECT {} FROM score").format(_SCORE_COLS))
+        cur.execute(
+            "SELECT s.item_id, (SELECT p.file_path FROM track_server_map p "
+            "WHERE p.item_id = s.item_id AND p.server_id = %s "
+            "AND p.file_path IS NOT NULL LIMIT 1), "
+            "s.title, s.author, s.album, s.album_artist "
+            "FROM score s WHERE " + registry.availability_sql('s'),
+            (default_id, default_id, True),
+        )
         rows = cur.fetchall() or []
     return [_row_to_score_dict(r) for r in rows]
 
