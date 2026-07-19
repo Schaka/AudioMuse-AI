@@ -6,15 +6,18 @@ lives in core.
 
 ## What it does
 
-- **musicnn on the AMD GPU** via ONNX Runtime's `MIGraphXExecutionProvider`,
-  registered with `only_models=["musicnn"]` so it never touches CLAP or Whisper
-  (MIGraphX can't parse those graphs).
+- **musicnn and the CLAP audio encoder on the AMD GPU** via ONNX Runtime's
+  `MIGraphXExecutionProvider`, registered with `only_models=["musicnn", "clap"]`
+  so it never touches the Whisper decoder (MIGraphX can't parse that graph).
+  CLAP needs its symbolic time axis pinned to a static shape before MIGraphX
+  can compile it, applied by core for compile-style providers
+  (`tasks/clap_analyzer.py:_prepared_model_bytes`).
 - **lyrics ASR on the AMD GPU** by registering `faster_whisper.py` as the `asr`
   analysis provider (`register_analysis_provider('asr', ...)`), replacing the
   built-in ONNX Whisper backend that MIGraphX can't run.
 
-CLAP audio and clustering (RAPIDS cuML) stay on CPU: MIGraphX can't parse CLAP's
-Resize op, and cuML has no ROCm port.
+CLAP's text encoder and clustering (RAPIDS cuML) stay on CPU: the text encoder
+runs Flask-side with runtime-variable batch shapes, and cuML has no ROCm port.
 
 ## Requirements
 
@@ -30,6 +33,16 @@ plugin detects the missing provider and stays inert.
    provider scoping (`plugin/api.py`, `tasks/analysis_helper.py`).
 2. `register_analysis_provider('asr', factory)` - component replacement, resolved
    by `lyrics/_asr_backend.py` before the built-in `whisper_onnx`.
+
+## Plugin settings
+
+- `fp16_enable` (default `true`) - enables `migraphx_fp16_enable` on the
+  MIGraphX provider. A GPU page fault in a MIGraphX-compiled kernel
+  (`mul_add_kernel` / `convert_mul_add_kernel`) has been seen on gfx1201
+  (RX 9070 XT / RDNA4) during MusiCNN/CLAP inference, but it recurs with fp16
+  both on and off, so it isn't fp16-specific - disabling fp16 here doesn't fix
+  it, just gives up the throughput. Edit via the plugin's Settings button on
+  the admin Plugins page (`{"fp16_enable": false}`) if you want it off anyway.
 
 ## Env (set by the ROCm image, override if needed)
 

@@ -2,9 +2,11 @@
 
 Wires AMD GPU acceleration into the analysis pipeline without forking core:
 
-* musicnn runs on the AMD GPU through ONNX Runtime's MIGraphXExecutionProvider,
-  scoped to musicnn only (MIGraphX can't parse CLAP's Resize op or the Whisper
-  decoder, so those stay on their default chain).
+* musicnn and the CLAP audio encoder run on the AMD GPU through ONNX Runtime's
+  MIGraphXExecutionProvider, scoped to those two models only. CLAP needs its
+  symbolic time axis pinned to a static shape before MIGraphX can compile it
+  (see ``tasks/clap_analyzer.py:_prepared_model_bytes``). The Whisper decoder
+  has no such fixup, so it stays off this chain entirely.
 * lyrics ASR is swapped to faster-whisper (CTranslate2's ROCm backend) because
   MIGraphX can't run the ONNX Whisper decoder at all.
 
@@ -14,6 +16,8 @@ other image the plugin registers nothing and stays inert.
 """
 
 import logging
+
+from plugin.api import get_setting
 
 logger = logging.getLogger("plugin.rocm_accelerator")
 
@@ -54,16 +58,26 @@ def register(ctx):
         )
         return
 
+    # fp16 defaults on. A GPU page fault (mul_add_kernel / convert_mul_add_kernel)
+    # has been seen on gfx1201 (RX 9070 XT / RDNA4) during MusiCNN/CLAP inference
+    # with fp16 both on and off, so it isn't fp16-specific - disabling fp16 buys
+    # no safety, just throughput. Opt out via the plugin's settings if needed.
+    options = {
+        "device_id": 0,
+        "migraphx_model_cache_dir": "/app/.cache/migraphx",
+    }
+    if get_setting("fp16_enable", True):
+        options["migraphx_fp16_enable"] = "1"
+
     ctx.register_onnx_provider(
         "MIGraphXExecutionProvider",
-        {
-            "device_id": 0,
-            "migraphx_fp16_enable": "1",
-            "migraphx_model_cache_dir": "/app/.cache/migraphx",
-        },
-        only_models=["musicnn"],
+        options,
+        only_models=["musicnn", "clap"],
     )
-    logger.info("Registered MIGraphX ONNX provider for musicnn (AMD GPU)")
+    logger.info(
+        "Registered MIGraphX ONNX provider for musicnn and CLAP audio (AMD GPU, fp16=%s)",
+        options.get("migraphx_fp16_enable", "0"),
+    )
 
     if _faster_whisper_available():
         ctx.register_analysis_provider("asr", _asr_factory)

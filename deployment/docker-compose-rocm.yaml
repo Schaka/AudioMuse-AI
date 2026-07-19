@@ -131,6 +131,10 @@ services:
       # Persist the MIOpen kernel cache so GPU kernels are not recompiled on every
       # restart (matches MIOPEN_CUSTOM_CACHE_DIR baked into Dockerfile-rocm).
       - miopen-cache:/app/.cache/miopen
+      # Persist the MIGraphX compiled-model cache (matches migraphx_model_cache_dir
+      # set by the ROCm Accelerator plugin) so musicnn/CLAP aren't recompiled on
+      # every container restart.
+      - migraphx-cache:/app/.cache/migraphx
     depends_on:
       - redis
       - postgres
@@ -145,3 +149,4 @@ volumes:
   plugins-flask:
   plugins-worker:
   miopen-cache:
+  migraphx-cache:

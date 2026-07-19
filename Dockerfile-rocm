@@ -16,7 +16,7 @@
 # source to COPY --from the published image and drop the local COPY.
 #
 # Build + run: see deployment/docker-compose-rocm.yaml
-ARG BASE_IMAGE=rocm/onnxruntime:rocm7.2.4_ub24.04_ort1.23_torch2.10.0
+ARG BASE_IMAGE=ghcr.io/schaka/rocm-migraphx-ort-torch-builder:20260719-gfx1201
 # Published CPU image already bundles the analysis models; copy instead of re-downloading.
 ARG MODELS_IMAGE=ghcr.io/neptunehub/audiomuse-ai:latest
 
@@ -83,7 +83,17 @@ RUN set -eux; \
 ARG CT2_VERSION=4.8.1
 RUN set -eux; \
     cd /tmp; \
-    wget -q "https://github.com/OpenNMT/CTranslate2/releases/download/v${CT2_VERSION}/rocm-python-wheels-Linux.zip"; \
+    n=0; \
+    until [ "$n" -ge 5 ]; do \
+        if wget "https://github.com/OpenNMT/CTranslate2/releases/download/v${CT2_VERSION}/rocm-python-wheels-Linux.zip"; then \
+            break; \
+        fi; \
+        rm -f rocm-python-wheels-Linux.zip; \
+        n=$((n+1)); \
+        echo "wget attempt $n failed - retrying in $((n*n))s"; \
+        sleep $((n*n)); \
+    done; \
+    test -f rocm-python-wheels-Linux.zip; \
     "$VIRTUAL_ENV/bin/python3" -c "import zipfile; zipfile.ZipFile('rocm-python-wheels-Linux.zip').extractall('ct2whl')"; \
     py_ver="$("$VIRTUAL_ENV/bin/python3" -c 'import sys; print(f"cp{sys.version_info.major}{sys.version_info.minor}")')"; \
     whl="$(find ct2whl -name "ctranslate2-${CT2_VERSION}-${py_ver}-${py_ver}-*.whl" | head -1)"; \
@@ -144,11 +154,12 @@ RUN set -eux; \
 # Application code with the plugin seams (last, for cache hits on code changes).
 COPY . /app
 COPY deployment/docker-entrypoint.sh /app/docker-entrypoint.sh
+COPY deployment/docker-entrypoint-rocm-wrapper.sh /app/docker-entrypoint-rocm-wrapper.sh
 COPY deployment/supervisord-rocm.conf /etc/supervisor/conf.d/supervisord.conf
-RUN chmod +x /app/docker-entrypoint.sh && \
+RUN chmod +x /app/docker-entrypoint.sh /app/docker-entrypoint-rocm-wrapper.sh && \
     test -f /etc/supervisor/conf.d/supervisord.conf
 
 EXPOSE 8000
 WORKDIR /workspace
-ENTRYPOINT ["/app/docker-entrypoint.sh"]
+ENTRYPOINT ["/app/docker-entrypoint-rocm-wrapper.sh"]
 CMD []
