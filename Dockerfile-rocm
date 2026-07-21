@@ -16,7 +16,7 @@
 # source to COPY --from the published image and drop the local COPY.
 #
 # Build + run: see deployment/docker-compose-rocm.yaml
-ARG BASE_IMAGE=ghcr.io/schaka/rocm-migraphx-ort-torch-builder:20260719-gfx1201
+ARG BASE_IMAGE=ghcr.io/schaka/rocm-migraphx-ort-torch-builder:20260721-gfx1201
 # Published CPU image already bundles the analysis models; copy instead of re-downloading.
 ARG MODELS_IMAGE=ghcr.io/neptunehub/audiomuse-ai:latest
 
