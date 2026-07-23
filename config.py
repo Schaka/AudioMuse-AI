@@ -622,6 +622,13 @@ CLAP_PYTHON_MULTITHREADS = os.environ.get("CLAP_PYTHON_MULTITHREADS", "False").l
 #   Cons: May see gradual VRAM growth on some systems
 PER_SONG_MODEL_RELOAD = os.environ.get("PER_SONG_MODEL_RELOAD", "true").lower() == "true"
 
+# Maximum number of spectrogram patches sent through the MusiCNN embedding
+# model in a single ONNX inference call. Running a whole track as one batch
+# (the previous behavior) makes the convolution activations peak at several
+# GB of RAM/VRAM on long tracks; small batches keep peak memory flat with no
+# measurable speed cost. Set to 0 to disable chunking (one whole-track batch).
+MUSICNN_BATCH_SIZE = int(os.environ.get("MUSICNN_BATCH_SIZE", 8))
+
 # Category weights for CLAP query generation (affects random query sampling probabilities)
 # Higher weights favor categories where CLAP excels (Genre, Instrumentation)
 # Format: JSON string with category names as keys and float weights as values

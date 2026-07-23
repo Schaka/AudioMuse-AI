@@ -75,6 +75,7 @@ These are the default parameters used when launching analysis or clustering task
 | `CLAP_ENABLED`                              | If false disable CLAP model during the analysis and the use of Text Search functionality.                                  | `true` |
 | `CLAP_PYTHON_MULTITHREADS`                  | CPU threading for CLAP analysis. False (default) = Use ONNX internal threading (recommended). True = Use Python ThreadPoolExecutor  | `false`         |
 | `PER_SONG_MODEL_RELOAD`                     | Model reloading strategy. true (default) = Unload MusiCNN and CLAP after each song (stable VRAM, slower). false = MusiCNN reloads every 20 songs, CLAP at album end (faster but may accumulate VRAM) | `true`          |
+| `MUSICNN_BATCH_SIZE`                        | Max spectrogram patches per MusiCNN embedding inference call. Small batches keep peak RAM/VRAM flat on long tracks. 0 = whole track in one batch (previous behavior) | `8`             |
 | **Analysis General**                        |                                                                                                                            |                 |
 | `NUM_RECENT_ALBUMS`                         | Number of recent albums to scan (0 for all).                                                                              | `0`             |
 | `TOP_N_MOODS`                               | Number of top moods per track for feature vector.                                                                         | `5`             |
