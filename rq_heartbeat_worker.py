@@ -6,7 +6,8 @@
 # the terms of the GNU Affero General Public License v3.0. See the LICENSE file
 # in the project root or <https://github.com/NeptuneHub/AudioMuse-AI/blob/main/LICENSE>
 
-"""Worker class selection, with a heartbeat that keeps long jobs alive on Windows.
+"""Worker class selection, with a heartbeat that keeps long jobs alive on Windows
+and re-registers a worker that a transient Redis outage silently deregistered.
 
 RQ's forking ``Worker`` refreshes a running job's started-registry score from its
 monitor loop, so the RQ janitor can tell a live job from a dead one. ``SimpleWorker``
@@ -15,32 +16,51 @@ monitor loop, so it never refreshes that score: it is written once as
 ``now + DEFAULT_WORKER_TTL`` (420s) and then goes stale, even for ``job_timeout=-1``.
 The janitor's ``started_registry.cleanup()`` then expires the entry and either
 re-queues the job or fails it, so no analysis, clustering, cleaning or sweep running
-longer than seven minutes could ever complete on Windows.
+longer than seven minutes could ever complete on Windows. The Windows heartbeat must
+NOT be replaced by returning -1 from get_heartbeat_ttl: Execution.save would then
+EXPIRE the key with a negative TTL, deleting it the instant the job starts.
+
+Issue #784: if Redis is unreachable longer than the worker-key TTL, the key expires,
+clean_worker_registry SREMs the worker from ``rq:workers``, and on reconnect only the
+heartbeat (HSET last_heartbeat + EXPIRE) recreates the key - register() ran once at
+birth, so the live worker keeps taking jobs while invisible to the dashboard. The
+mixin re-runs register() on every heartbeat (idempotent SADD) and re-serializes the
+identity hash if the key came back as a partial, so a recovered worker rejoins.
 
 Main Features:
+* ReregisterOnHeartbeatMixin: SADDs the worker back into rq:workers on each heartbeat
+  and restores hostname/birth/queues if the key expired and was recreated partial.
 * HeartbeatSimpleWorker: runs perform_job on the main thread while a daemon thread
   calls maintain_heartbeats, giving SimpleWorker the liveness signal the forking
-  worker gets for free.
-* WorkerClass: HeartbeatSimpleWorker on win32, the stock forking Worker elsewhere.
+  worker gets for free; also carries the re-registration mixin.
+* WorkerClass: HeartbeatSimpleWorker on win32, a re-registering forking Worker elsewhere.
 """
 
 import logging
 import sys
 import threading
 
-from rq import SimpleWorker, Worker
+from rq import SimpleWorker, Worker, worker_registration
 
 logger = logging.getLogger(__name__)
 
 
-class HeartbeatSimpleWorker(SimpleWorker):
-    """SimpleWorker that keeps refreshing the started-registry score while it works.
+class ReregisterOnHeartbeatMixin:
+    def heartbeat(self, timeout=None, pipeline=None):
+        super().heartbeat(timeout=timeout, pipeline=pipeline)
+        try:
+            worker_registration.register(self, pipeline)
+            if pipeline is None and not self.connection.hexists(self.key, 'birth'):
+                self.connection.hset(self.key, mapping=self.serialize())
+        except Exception:
+            logger.exception("Worker %s: re-registration on heartbeat failed", self.name)
 
-    The heartbeat must NOT be replaced by returning -1 from get_heartbeat_ttl:
-    Execution.save would then call Redis EXPIRE with a negative TTL, which deletes
-    the key immediately and makes the job look dead the instant it starts.
-    """
 
+class ReregisteringWorker(ReregisterOnHeartbeatMixin, Worker):
+    pass
+
+
+class HeartbeatSimpleWorker(ReregisterOnHeartbeatMixin, SimpleWorker):
     def execute_job(self, job, queue):
         stop = threading.Event()
 
@@ -62,4 +82,4 @@ class HeartbeatSimpleWorker(SimpleWorker):
             stop.set()
 
 
-WorkerClass = HeartbeatSimpleWorker if sys.platform == 'win32' else Worker
+WorkerClass = HeartbeatSimpleWorker if sys.platform == 'win32' else ReregisteringWorker
