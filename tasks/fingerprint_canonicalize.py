@@ -347,17 +347,9 @@ def _ivf_candidate_pairs(cur, ids, valid, loaded, provider_durations, source_id)
         ):
             first = first.astype(np.int64)
             second = second.astype(np.int64)
-            left_durations = row_duration[first]
-            right_durations = row_duration[second]
-            with np.errstate(invalid='ignore'):
-                compatible = (
-                    np.isfinite(left_durations)
-                    & np.isfinite(right_durations)
-                    & (left_durations > 0)
-                    & (right_durations > 0)
-                    & (np.abs(left_durations - right_durations)
-                       <= config.DURATION_TOLERANCE_SECONDS)
-                )
+            compatible = simhash.duration_mask_arrays(
+                row_duration[first], row_duration[second]
+            )
             if not compatible.any():
                 continue
             pending_first.append(first[compatible])
@@ -523,11 +515,20 @@ def _build_mapping(cur, source_id):
     duplicate_mapping = {}
     canonical_of = dict(enumerate(ids[:canonical_loaded]))
     taken = set(ids[:canonical_loaded])
+    unsignable_ids = [
+        ids[row] for row in range(canonical_loaded, loaded) if not valid[row]
+    ]
+    unsignable_provider_of = (
+        _default_provider_ids(cur, source_id, unsignable_ids)
+        if unsignable_ids else {}
+    )
     unsignable = 0
     for row in range(canonical_loaded, loaded):
         legacy_id = ids[row]
         if not valid[row]:
-            mapping[legacy_id] = simhash.unsignable_canonical_id(source_id, legacy_id)
+            mapping[legacy_id] = simhash.unsignable_canonical_id(
+                source_id, unsignable_provider_of.get(legacy_id, legacy_id)
+            )
             unsignable += 1
             continue
         target = int(parent[row])
@@ -730,7 +731,8 @@ def _copy_track_server_map(cur, source_id, all_changes, default_provider_ids,
         "SELECT item_id, server_id, provider_track_id, match_tier, file_path, now() "
         "FROM incoming_default_map "
         "ON CONFLICT (server_id, provider_track_id) DO UPDATE SET "
-        "match_tier = EXCLUDED.match_tier, "
+        "match_tier = CASE WHEN EXCLUDED.match_tier = 'analysis' "
+        "THEN EXCLUDED.match_tier ELSE track_server_map.match_tier END, "
         "file_path = COALESCE(EXCLUDED.file_path, track_server_map.file_path)"
     )
     cur.execute(
@@ -1025,7 +1027,7 @@ def canonicalize_fingerprinted_ids(conn=None, log_fn=None, source_server_id=None
         # racing the same key rewrite and DDL through the FK drop/re-add.
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (_RELABEL_ADVISORY_LOCK,))
         source_id = source_server_id or registry.get_default_server_id(db)
-        if source_id is None:
+        if not source_id:
             logger.warning(
                 "Canonicalization skipped: no default server row exists to preserve the "
                 "provider ids; relabelling now would lose them"

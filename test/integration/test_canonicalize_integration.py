@@ -538,6 +538,64 @@ class TestRealCanonicalization:
             "the fp_0 row never re-triggers the migration"
         )
 
+    def test_unsignable_fp0_uses_the_source_servers_provider_id_when_mapped(self, db):
+        from tasks import fingerprint_canonicalize as fc
+
+        flat = np.full(simhash.SIGNATURE_BITS, 0.5, dtype=np.float32)
+        tracks = [
+            ('old-key', '/music/T/tone.flac', flat),
+            ('jf-1', '/music/A/song.flac', _distinct_embedding(1)),
+        ]
+        _build(db, tracks)
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO track_server_map "
+                "(item_id, server_id, provider_track_id, match_tier) "
+                "VALUES ('old-key', 'srv', 'nav-123', 'default')"
+            )
+        db.commit()
+
+        fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        expected = simhash.unsignable_canonical_id('srv', 'nav-123')
+        maps = {p: item for p, item, _f in _maps(db)}
+        assert maps['nav-123'] == expected, (
+            "the fp_0 id is minted from the server's REAL provider id, not the "
+            "legacy score key, so a later re-analysis resolves to the same row"
+        )
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT match_tier FROM track_server_map "
+                "WHERE provider_track_id = 'nav-123'"
+            )
+            assert cur.fetchone()[0] == 'analysis'
+        second = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+        assert second == {'relabelled': 0, 'duplicates': 0}
+
+    def test_relabel_preserves_an_existing_provider_migration_tier(self, db):
+        from tasks import fingerprint_canonicalize as fc
+
+        tracks = [('jf-1', '/music/A/song.flac', _distinct_embedding(1))]
+        _build(db, tracks)
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO track_server_map "
+                "(item_id, server_id, provider_track_id, match_tier) "
+                "VALUES ('jf-1', 'srv', 'jf-1', 'exact')"
+            )
+        db.commit()
+
+        fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT match_tier FROM track_server_map "
+                "WHERE provider_track_id = 'jf-1'"
+            )
+            assert cur.fetchone()[0] == 'exact', (
+                "a signable row's relabel must not clobber the stored match tier"
+            )
+
     def test_a_rewrite_that_fails_its_own_checks_is_rolled_back(self, db, monkeypatch):
         """The point of no return. A rewrite that would commit a corrupt catalogue
         must instead leave it byte-for-byte unchanged and fail the boot loudly."""

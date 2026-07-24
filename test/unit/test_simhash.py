@@ -121,6 +121,7 @@ class TestCanonicalId:
         assert not simhash.is_unsignable_id(signature_id)
         assert not simhash.is_unsignable_id(fp0[:-1])
         assert not simhash.is_unsignable_id(None)
+        assert simhash.is_unsignable_id('fp_0' + 'a' * 50)
 
 
 class TestSignatureIndex:
