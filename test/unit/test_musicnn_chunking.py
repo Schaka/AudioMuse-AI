@@ -12,6 +12,11 @@ Verifies that _run_musicnn_models never sends more than MUSICNN_BATCH_SIZE
 patches to the embedding model in one inference call, that every patch is
 still processed exactly once and in order, and that the pooled outputs are
 identical to the single whole-track batch (MUSICNN_BATCH_SIZE=0).
+
+Main Features:
+* Asserts no embedding inference call exceeds MUSICNN_BATCH_SIZE patches.
+* Checks every patch is processed exactly once and in original order.
+* Confirms chunked output matches the whole-track batch (MUSICNN_BATCH_SIZE=0).
 """
 
 import numpy as np
