@@ -41,7 +41,8 @@ is stamped with a 0 sentinel so the whole catalogue is not re-listed for it on
 every boot - 0 behaves exactly like NULL for identity (never confirms a merge)
 and a later re-analysis overwrites it with the real length. Durations come from
 ONE metadata listing per server (no per-id/batch fetch, no audio downloads),
-fetched concurrently across servers. It never deletes a score or embedding row.
+fetched concurrently across servers. The duration backfill and re-verify never
+delete a score or embedding row; the separate migration-only orphan purge does.
 
 Main Features:
 * Table-derived, marker-free idempotency via score.duration - instant no-op once
@@ -54,6 +55,16 @@ Main Features:
 * split_chromaprint_false_merges: cleaning-time Path B - splits a same-server
   duplicate group whose stored Chromaprints prove its files are different
   recordings (skip-if-missing); unmaps only, never deletes a catalogue row.
+* purge_orphan_catalogue_rows: migration-only cleanup - deletes every score row
+  bound to no server (false-merge splits plus pre-existing orphans), so the
+  catalogue is clean after a migration; embeddings cascade, per-file Chromaprints
+  are kept, and each deleted track re-analyzes under its own id if its file returns.
+  It needs no complete-listing guard (unlike the cleaning pass): it never interprets
+  a server listing, only the map table itself, and an unreachable server keeps its
+  map rows, so a track still on any server is never purged. The one accepted window
+  is a concurrently analyzing track between its score insert and its map flush on
+  the migration boot itself - hitting it costs that track one re-analysis, nothing
+  more.
 """
 
 import logging
@@ -86,6 +97,7 @@ _NO_SERVER_DURATION = 0.0
 _REPAIR_ADVISORY_LOCK = 726354823
 _SAME_FOLDER_ADVISORY_LOCK = 726354824
 _CHROMAPRINT_ADVISORY_LOCK = 726354825
+_ORPHAN_PURGE_ADVISORY_LOCK = 726354826
 
 
 def _empty_totals():
@@ -472,6 +484,48 @@ def repair_duplicate_track_maps(conn=None, prefetched_durations=None):
         return _run_migration(db, cur, prefetched_durations)
     finally:
         _release(cur, db, acquired, own_conn)
+
+
+def purge_orphan_catalogue_rows(conn=None):
+    own_conn = conn is None
+    db = conn or connect_raw()
+    acquired = False
+    cur = None
+    try:
+        _force_no_autocommit(db)
+        cur = db.cursor()
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (_ORPHAN_PURGE_ADVISORY_LOCK,))
+        acquired = bool(cur.fetchone()[0])
+        if not acquired:
+            return {'skipped': 'locked'}
+        removed = 0
+        while True:
+            cur.execute(
+                "DELETE FROM score WHERE item_id IN ("
+                "SELECT s.item_id FROM score s "
+                "WHERE NOT EXISTS (SELECT 1 FROM track_server_map t "
+                "WHERE t.item_id = s.item_id) LIMIT %s)",
+                (_DELETE_CHUNK,),
+            )
+            deleted = cur.rowcount
+            removed += deleted
+            db.commit()
+            if deleted < _DELETE_CHUNK:
+                break
+        if removed:
+            logger.info(
+                "Migration orphan purge: deleted %d catalogue row(s) bound to no "
+                "server (embeddings cascade; per-file Chromaprints are kept for reuse; "
+                "each re-analyzes under its own id if its file returns).",
+                removed,
+            )
+        return {'purged': removed}
+    except Exception:
+        _rollback(db)
+        logger.exception("Migration orphan purge failed; it retries on the next start")
+        return {'error': 'failed'}
+    finally:
+        _release(cur, db, acquired, own_conn, _ORPHAN_PURGE_ADVISORY_LOCK)
 
 
 def _same_folder_conflicts(cur):

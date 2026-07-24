@@ -781,9 +781,23 @@ def _legacy_cursor(legacy_rows, canonical_rows=()):
     hash their signatures a batch at a time, then fetches embeddings BACK for
     the candidate pairs it asks the cosine to confirm.
     """
+    import numpy as np
+    from tasks import simhash as _sh
+    from tasks.paged_ivf import pack_directory
+
     canonical_rows = list(canonical_rows)
     legacy_rows = list(legacy_rows)
     blobs = {str(item_id): blob for item_id, blob in canonical_rows + legacy_rows}
+
+    all_ids = list(blobs.keys())
+    ivf_blob = (
+        pack_directory(
+            np.zeros((1, _sh.SIGNATURE_BITS), dtype=np.float32),
+            np.zeros(len(all_ids), dtype=np.uint32),
+            all_ids, _sh.SIGNATURE_BITS, 'angular',
+        )
+        if all_ids else None
+    )
 
     class ScanCursor:
         def __init__(self, rows):
@@ -802,10 +816,24 @@ def _legacy_cursor(legacy_rows, canonical_rows=()):
     class FetchCursor:
         def __init__(self):
             self._rows = []
+            self._one = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
 
         def execute(self, sql, params=None):
+            if 'ivf_dir' in sql:
+                self._one = (ivf_blob,) if ('name = %s' in sql and ivf_blob) else None
+                self._rows = []
+                return
             wanted = list(params[0]) if params else []
             self._rows = [(i, blobs[i]) for i in wanted if i in blobs]
+
+        def fetchone(self):
+            return self._one
 
         def fetchall(self):
             return self._rows

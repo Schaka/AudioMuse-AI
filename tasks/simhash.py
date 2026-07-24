@@ -257,13 +257,7 @@ def folder_conflict_in_group(paths):
     return False
 
 
-def _duration_mask(left_durations, right_durations, size):
-    left = np.full(size, np.nan) if left_durations is None else np.asarray(
-        [np.nan if d is None else d for d in left_durations], dtype=np.float64
-    )
-    right = np.full(size, np.nan) if right_durations is None else np.asarray(
-        [np.nan if d is None else d for d in right_durations], dtype=np.float64
-    )
+def duration_mask_arrays(left, right):
     with np.errstate(invalid='ignore'):
         return (
             np.isfinite(left)
@@ -272,6 +266,16 @@ def _duration_mask(left_durations, right_durations, size):
             & (right > 0)
             & (np.abs(left - right) <= DURATION_TOLERANCE_SECONDS)
         )
+
+
+def _duration_mask(left_durations, right_durations, size):
+    left = np.full(size, np.nan) if left_durations is None else np.asarray(
+        [np.nan if d is None else d for d in left_durations], dtype=np.float64
+    )
+    right = np.full(size, np.nan) if right_durations is None else np.asarray(
+        [np.nan if d is None else d for d in right_durations], dtype=np.float64
+    )
+    return duration_mask_arrays(left, right)
 
 
 def confirm_pairs(left_vectors, right_vectors, left_durations=None, right_durations=None,
@@ -434,6 +438,14 @@ def signature_from_canonical_id(item_id):
         return int(item_id[len(_ID_HEAD):], 16) & _SIGNATURE_MASK
     except (TypeError, ValueError):
         return None
+
+
+def is_unsignable_id(item_id):
+    return (
+        isinstance(item_id, str)
+        and len(item_id) == len(_UNSIGNABLE_HEAD) + _HEX_LEN
+        and item_id.startswith(_UNSIGNABLE_HEAD)
+    )
 
 
 def is_fingerprint_id(item_id):
