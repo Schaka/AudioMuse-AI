@@ -18,8 +18,10 @@ Main Features:
 * A legacy catalogue is relabelled for real: provider ids become content ids,
   the provider ids survive in track_server_map, and the legacy score.file_path
   moves onto the server's own map row.
-* Identical audio with matching duration merges into ONE catalogue row and the
-  merged row keeps its path; a different or unknown duration always splits.
+* Duplicate candidates come from the audio IVF cluster directory (seeded here):
+  identical audio in one cluster with matching duration merges into ONE catalogue
+  row and keeps its path; a different or unknown duration splits; and a track the
+  index does not cover - or a missing index entirely - merges nothing (fail-safe).
 * The verification gate ROLLS BACK a rewrite that violates its invariants, leaving
   the catalogue byte-for-byte as it was.
 * The embedding cascade is re-added even when no constraint existed to find.
@@ -71,7 +73,8 @@ _SCHEMA = [
     "CREATE TABLE map_projection_data (index_name VARCHAR(255) PRIMARY KEY, "
     "projection_data BYTEA NOT NULL, id_map_json TEXT NOT NULL, "
     "embedding_dimension INTEGER NOT NULL)",
-    "CREATE TABLE ivf_dir (name TEXT PRIMARY KEY, blob_data BYTEA NOT NULL)",
+    "CREATE TABLE ivf_dir (name TEXT PRIMARY KEY, blob_data BYTEA NOT NULL, "
+    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
 ]
 
 _EMBEDDING_FK = (
@@ -139,6 +142,28 @@ def _build(conn, tracks, embedding_ddl=_EMBEDDING_FK):
                 (item_id, psycopg2.Binary(vector.astype(np.float32).tobytes())),
             )
     conn.commit()
+
+
+def _seed_ivf(conn, entries):
+    from tasks.paged_ivf import pack_directory
+    import config as cfg
+
+    item_ids = [item_id for item_id, _cell in entries]
+    id2cell = np.array([cell for _item_id, cell in entries], dtype=np.uint32)
+    n_cells = int(id2cell.max()) + 1 if id2cell.size else 1
+    centroids = np.zeros((n_cells, simhash.SIGNATURE_BITS), dtype=np.float32)
+    blob = pack_directory(centroids, id2cell, item_ids, simhash.SIGNATURE_BITS, 'angular')
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ivf_dir (name, blob_data) VALUES (%s, %s) "
+            "ON CONFLICT (name) DO UPDATE SET blob_data = EXCLUDED.blob_data",
+            ('%s__ivf_dir' % cfg.INDEX_NAME, psycopg2.Binary(blob)),
+        )
+    conn.commit()
+
+
+def _seed_ivf_all(conn, tracks):
+    _seed_ivf(conn, [(item_id, 0) for item_id, _path, _vec in tracks])
 
 
 def _score(conn):
@@ -261,6 +286,7 @@ class TestRealCanonicalization:
             ('jf-3', '/music/Other/03.flac', _distinct_embedding(9)),
         ]
         _build(db, tracks)
+        _seed_ivf_all(db, tracks)
 
         result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
 
@@ -307,6 +333,7 @@ class TestRealCanonicalization:
             ('jf-3', '/music/Album/03.flac', same.copy()),
         ]
         _build(db, tracks)
+        _seed_ivf_all(db, tracks)
 
         result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
 
@@ -338,6 +365,7 @@ class TestRealCanonicalization:
             ('jf-2', '/music/Arrau/nocturne.flac', same.copy()),
         ]
         _build(db, tracks)
+        _seed_ivf_all(db, tracks)
 
         result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
 
@@ -360,6 +388,7 @@ class TestRealCanonicalization:
             ('jf-2', '/music/Best Of/07 Rio.flac', same.copy()),
         ]
         _build(db, tracks)
+        _seed_ivf_all(db, tracks)
 
         result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
 
@@ -367,6 +396,62 @@ class TestRealCanonicalization:
             "without durations nothing can be proven identical, so nothing merges"
         )
         assert len(_score(db)) == 2
+
+    def test_without_an_ivf_index_every_track_stays_unique(self, db, monkeypatch):
+        from tasks import fingerprint_canonicalize as fc
+
+        monkeypatch.setattr(
+            fc, '_fetch_provider_durations',
+            lambda source_id, conn: {'jf-1': 200.0, 'jf-2': 200.0},
+        )
+        same = _distinct_embedding(7)
+        tracks = [
+            ('jf-1', '/music/Album/01 Rio.flac', same),
+            ('jf-2', '/music/Best Of/07 Rio.flac', same.copy()),
+        ]
+        _build(db, tracks)
+
+        result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        assert result['duplicates'] == 0, (
+            "with no IVF index there are no clusters to compare, so nothing merges"
+        )
+        assert len(_score(db)) == 2
+        assert {p for p, _i, _f in _maps(db)} == {'jf-1', 'jf-2'}, "both files stay mapped"
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM score s WHERE NOT EXISTS "
+                "(SELECT 1 FROM track_server_map t WHERE t.item_id = s.item_id)"
+            )
+            assert cur.fetchone()[0] == 0, "the fail-safe leaves no orphan"
+
+    def test_a_track_missing_from_the_ivf_index_stays_unique_while_others_merge(
+        self, db, monkeypatch
+    ):
+        from tasks import fingerprint_canonicalize as fc
+
+        monkeypatch.setattr(
+            fc, '_fetch_provider_durations',
+            lambda source_id, conn: {'jf-1': 200.0, 'jf-2': 200.0, 'jf-3': 200.0},
+        )
+        same = _distinct_embedding(7)
+        tracks = [
+            ('jf-1', '/music/Album/01.flac', same),
+            ('jf-2', '/music/Best Of/07.flac', same.copy()),
+            ('jf-3', '/music/Live/03.flac', same.copy()),
+        ]
+        _build(db, tracks)
+        _seed_ivf(db, [('jf-1', 0), ('jf-2', 0)])
+
+        result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        assert result['duplicates'] == 1, "the two indexed copies merge"
+        assert len(_score(db)) == 2, "jf-3 is not in the index, so it keeps its own id"
+        by_provider = {p: item for p, item, _f in _maps(db)}
+        assert by_provider['jf-1'] == by_provider['jf-2']
+        assert by_provider['jf-3'] != by_provider['jf-1'], (
+            "a track missing from the index is never merged"
+        )
 
     def test_a_rewrite_that_fails_its_own_checks_is_rolled_back(self, db, monkeypatch):
         """The point of no return. A rewrite that would commit a corrupt catalogue

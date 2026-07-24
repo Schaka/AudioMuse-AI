@@ -326,6 +326,17 @@ if not _is_worker:
                     "Startup same-folder cleanup failed (will retry next boot): %s",
                     _folder_exc,
                 )
+            # Leave a clean catalogue after a migration: delete every row a false
+            # split (or a prior run) left bound to no server, so re-analysis re-creates
+            # it under its own id rather than stranding an orphan.
+            try:
+                from tasks.duplicate_repair import purge_orphan_catalogue_rows
+                purge_orphan_catalogue_rows()
+            except Exception as _purge_exc:
+                app.logger.warning(
+                    "Startup migration orphan purge failed (will retry next boot): %s",
+                    _purge_exc,
+                )
 
         # Finalize JWT_SECRET - must happen after DB init so the value can be
         # persisted and shared across all gunicorn workers.
