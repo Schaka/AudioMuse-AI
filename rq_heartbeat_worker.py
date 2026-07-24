@@ -24,8 +24,15 @@ Issue #784: if Redis is unreachable longer than the worker-key TTL, the key expi
 clean_worker_registry SREMs the worker from ``rq:workers``, and on reconnect only the
 heartbeat (HSET last_heartbeat + EXPIRE) recreates the key - register() ran once at
 birth, so the live worker keeps taking jobs while invisible to the dashboard. The
-mixin re-runs register() on every heartbeat (idempotent SADD) and re-serializes the
+mixin re-runs register() on every heartbeat (idempotent SADD) and rebuilds the
 identity hash if the key came back as a partial, so a recovered worker rejoins.
+The re-registration always runs on the worker's OWN connection, never on the
+pipeline a heartbeat was given: rq 2.7.0's maintain_heartbeats reads its pipeline
+results by FIXED position (``results[7]`` is job.heartbeat's HSET), so any command
+injected into that pipeline shifts the slot onto an EXPIRE - which returns 1 for a
+live key - and RQ would delete the RUNNING job's key on every monitor beat. The
+identity mapping is built here (the same fields register_birth writes) because
+Worker.serialize does not exist on rq 2.7.0.
 
 Main Features:
 * ReregisterOnHeartbeatMixin: SADDs the worker back into rq:workers on each heartbeat
@@ -41,6 +48,7 @@ import sys
 import threading
 
 from rq import SimpleWorker, Worker, worker_registration
+from rq.utils import now, utcformat
 
 logger = logging.getLogger(__name__)
 
@@ -49,11 +57,25 @@ class ReregisterOnHeartbeatMixin:
     def heartbeat(self, timeout=None, pipeline=None):
         super().heartbeat(timeout=timeout, pipeline=pipeline)
         try:
-            worker_registration.register(self, pipeline)
-            if pipeline is None and not self.connection.hexists(self.key, 'birth'):
-                self.connection.hset(self.key, mapping=self.serialize())
+            worker_registration.register(self)
+            if not self.connection.hexists(self.key, 'birth'):
+                self.connection.hset(self.key, mapping=self._identity_mapping())
+                self.connection.expire(self.key, self.worker_ttl + 60)
         except Exception:
             logger.exception("Worker %s: re-registration on heartbeat failed", self.name)
+
+    def _identity_mapping(self):
+        stamp = utcformat(self.last_heartbeat or now())
+        return {
+            'birth': utcformat(self.birth_date) if self.birth_date else stamp,
+            'last_heartbeat': stamp,
+            'queues': ','.join(self.queue_names()),
+            'pid': self.pid or 0,
+            'hostname': self.hostname or '',
+            'ip_address': self.ip_address or '',
+            'version': self.version or '',
+            'python_version': self.python_version or '',
+        }
 
 
 class ReregisteringWorker(ReregisterOnHeartbeatMixin, Worker):

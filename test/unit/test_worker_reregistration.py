@@ -19,6 +19,9 @@ Main Features:
 * A heartbeat re-adds the worker to rq:workers and rq:workers:<queue> and restores
   the identity hash (birth/hostname/queues) when the key came back partial.
 * Re-registration is idempotent and does not rewrite the hash during normal beats.
+* Nothing is ever queued into rq's own heartbeat pipeline: rq 2.7.0 reads that
+  pipeline's results by fixed index, and an injected command would make it delete
+  the running job's key.
 """
 
 import types
@@ -148,12 +151,37 @@ def test_heartbeat_reregistration_is_idempotent_when_already_registered(worker_c
 
 
 @pytest.mark.parametrize('worker_cls', [rhw.ReregisteringWorker, rhw.HeartbeatSimpleWorker])
-def test_pipeline_heartbeat_queues_reregistration_without_restore(worker_cls):
+def test_pipelined_heartbeat_never_queues_into_rqs_pipeline(worker_cls):
     worker, fake = _make_worker(worker_cls)
     fake.hashes[worker.key] = {'last_heartbeat': 'stale'}
     fake.sets['rq:workers'] = set()
+    pipe = FakeRedis()
 
-    worker.heartbeat(pipeline=fake)
+    worker.heartbeat(pipeline=pipe)
 
+    assert pipe.sets == {}, (
+        "rq 2.7.0 reads maintain_heartbeats pipeline results by FIXED index "
+        "(results[7] = job.heartbeat); an injected command would shift it onto an "
+        "EXPIRE and delete the running job's key every monitor beat"
+    )
+    assert set(pipe.hashes.get(worker.key, {})) <= {'last_heartbeat'}
     assert worker.key in fake.smembers('rq:workers')
-    assert 'birth' not in fake.hashes[worker.key]
+    assert worker.key in fake.smembers('rq:workers:default')
+
+
+@pytest.mark.parametrize('worker_cls', [rhw.ReregisteringWorker, rhw.HeartbeatSimpleWorker])
+def test_pipelined_heartbeat_still_restores_identity_on_the_raw_connection(worker_cls):
+    worker, fake = _make_worker(worker_cls)
+    fake.hashes[worker.key] = {'last_heartbeat': 'stale'}
+    fake.sets['rq:workers'] = set()
+    pipe = FakeRedis()
+
+    worker.heartbeat(pipeline=pipe)
+
+    restored = fake.hashes[worker.key]
+    assert restored.get('birth')
+    assert restored.get('queues') == 'default'
+    assert fake.ttls.get(worker.key), (
+        "the recreated key must carry a TTL so a dead worker cannot leave a "
+        "zombie key behind"
+    )
