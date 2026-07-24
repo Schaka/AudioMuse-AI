@@ -178,11 +178,12 @@ def _stage_identity(item, plan, track_name_full, musicnn_embedding, fingerprint_
 def _stage_persist_musicnn(item, track_name_full, track_id_str, musicnn_analysis,
                            top_moods, musicnn_embedding):
     logger.info(
-        "SUCCESSFULLY ANALYZED '%s' as %s: tempo %.2f, energy %.4f, key %s %s, moods %s",
+        "SUCCESSFULLY ANALYZED '%s' as %s: tempo %.2f, energy %.4f, key %s %s",
         track_name_full, track_id_str,
         musicnn_analysis['tempo'], musicnn_analysis['energy'],
-        musicnn_analysis['key'], musicnn_analysis['scale'], top_moods,
+        musicnn_analysis['key'], musicnn_analysis['scale'],
     )
+    logger.info("-- moods %s", top_moods)
     _ah.persist_musicnn_results(
         item, musicnn_analysis, top_moods, musicnn_embedding,
         _ah.ZERO_OTHER_FEATURES,
