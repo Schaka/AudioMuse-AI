@@ -36,6 +36,7 @@ import onnxruntime as ort
 
 from config import (
     AUDIO_LOAD_TIMEOUT,
+    MUSICNN_BATCH_SIZE,
     OTHER_FEATURE_LABELS,
     PER_SONG_MODEL_RELOAD,
 )
@@ -431,17 +432,24 @@ def _run_musicnn_models(final_patches, mood_labels_list, model_paths, onnx_sessi
             onnx_sessions, model_paths
         )
 
-        embeddings_per_patch, new_embedding_sess = run_inference_with_oom_fallback(
-            embedding_sess,
-            {DEFINED_TENSOR_NAMES['embedding']['input']: final_patches},
-            DEFINED_TENSOR_NAMES['embedding']['output'],
-            model_paths['embedding'],
-            'embedding',
-            name,
-        )
-        if new_embedding_sess is not embedding_sess and onnx_sessions:
-            onnx_sessions['embedding'] = new_embedding_sess
-        embedding_sess = new_embedding_sess
+        # Chunked so peak memory stays flat: a whole-track batch needs several
+        # GB of convolution activations, well past small worker memory caps.
+        batch = MUSICNN_BATCH_SIZE if MUSICNN_BATCH_SIZE > 0 else len(final_patches)
+        embedding_chunks = []
+        for start in range(0, len(final_patches), batch):
+            chunk, new_embedding_sess = run_inference_with_oom_fallback(
+                embedding_sess,
+                {DEFINED_TENSOR_NAMES['embedding']['input']: final_patches[start:start + batch]},
+                DEFINED_TENSOR_NAMES['embedding']['output'],
+                model_paths['embedding'],
+                'embedding',
+                name,
+            )
+            if new_embedding_sess is not embedding_sess and onnx_sessions:
+                onnx_sessions['embedding'] = new_embedding_sess
+            embedding_sess = new_embedding_sess
+            embedding_chunks.append(chunk)
+        embeddings_per_patch = np.concatenate(embedding_chunks, axis=0)
 
         mood_logits, new_prediction_sess = run_inference_with_oom_fallback(
             prediction_sess,
