@@ -109,6 +109,19 @@ class TestCanonicalId:
         assert simhash.is_fingerprint_id('fp_' + 'a' * 16)
         assert not simhash.is_fingerprint_id('plain')
 
+    def test_unsignable_ids_are_scheme_zero_and_never_decode_as_signatures(self):
+        fp0 = simhash.unsignable_canonical_id('srv', 'track-1')
+        assert simhash.is_unsignable_id(fp0)
+        assert simhash.is_fingerprint_id(fp0)
+        assert not simhash.is_signature_id(fp0)
+        assert simhash.signature_from_canonical_id(fp0) is None
+        signature_id = simhash.canonical_id_str(
+            simhash.embedding_signature(_embedding(9))
+        )
+        assert not simhash.is_unsignable_id(signature_id)
+        assert not simhash.is_unsignable_id(fp0[:-1])
+        assert not simhash.is_unsignable_id(None)
+
 
 class TestSignatureIndex:
     def test_finds_exact_and_near(self):

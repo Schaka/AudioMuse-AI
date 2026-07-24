@@ -453,6 +453,91 @@ class TestRealCanonicalization:
             "a track missing from the index is never merged"
         )
 
+    def test_unsignable_embeddings_never_propose_or_receive_merges(self, db):
+        from tasks import fingerprint_canonicalize as fc
+
+        flat = np.full(simhash.SIGNATURE_BITS, 0.5, dtype=np.float32)
+        near_flat = flat.copy()
+        near_flat[0] += 1e-3
+        same = _distinct_embedding(7)
+        tracks = [
+            ('jf-flat', '/music/A/tone.flac', flat),
+            ('jf-nearflat', '/music/B/tone2.flac', near_flat),
+            ('jf-r1', '/music/C/song.flac', same),
+            ('jf-r2', '/music/D/song.flac', same.copy()),
+        ]
+        _build(db, tracks)
+        _seed_ivf_all(db, tracks)
+        with db.cursor() as cur:
+            cur.execute("UPDATE score SET duration = 200.0")
+        db.commit()
+
+        ids = [item_id for item_id, _path, _vec in tracks]
+        valid = np.array(
+            [simhash.embedding_signature(vec) is not None for _i, _p, vec in tracks]
+        )
+        assert not valid[0], "precondition: a constant embedding has no signature"
+        assert valid[1:].all()
+
+        with db.cursor() as cur:
+            left, right = fc._ivf_candidate_pairs(cur, ids, valid, len(ids), {}, 'srv')
+
+        pairs = set(zip(left.tolist(), right.tolist()))
+        assert pairs == {(2, 3)}, (
+            "only the two real copies pair; the signatureless constant embedding "
+            "proposes nothing and receives nothing, even though its cosine to the "
+            "near-constant track is ~1.0"
+        )
+
+    def test_a_constant_embedding_row_migrates_to_fp0_and_cannot_brick_the_boot(
+        self, db, monkeypatch
+    ):
+        from tasks import fingerprint_canonicalize as fc
+
+        monkeypatch.setattr(
+            fc, '_fetch_provider_durations',
+            lambda source_id, conn: {'jf-flat': 90.0, 'jf-1': 200.0, 'jf-2': 200.0},
+        )
+        flat = np.full(simhash.SIGNATURE_BITS, 0.5, dtype=np.float32)
+        same = _distinct_embedding(7)
+        tracks = [
+            ('jf-flat', '/music/T/tone.flac', flat),
+            ('jf-1', '/music/A/song.flac', same),
+            ('jf-2', '/music/B/song.flac', same.copy()),
+        ]
+        _build(db, tracks)
+        _seed_ivf_all(db, tracks)
+
+        result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        assert result['relabelled'] == 3
+        assert result['duplicates'] == 1
+        expected = simhash.unsignable_canonical_id('srv', 'jf-flat')
+        assert expected.startswith('fp_0')
+        maps = {p: item for p, item, _f in _maps(db)}
+        assert maps['jf-flat'] == expected, (
+            "the signatureless track gets the SAME server-scoped fp_0 id "
+            "analysis would mint for it"
+        )
+        assert maps['jf-1'] == maps['jf-2'], "the real duplicate still merges"
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT match_tier FROM track_server_map "
+                "WHERE provider_track_id = 'jf-flat'"
+            )
+            assert cur.fetchone()[0] == 'analysis', (
+                "the analysis tier is what exempts fp_0 rows from the legacy count"
+            )
+            cur.execute(
+                "SELECT count(*) FROM embedding WHERE item_id = %s", (expected,)
+            )
+            assert cur.fetchone()[0] == 1, "its analysis rows follow the relabel"
+
+        second = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+        assert second == {'relabelled': 0, 'duplicates': 0}, (
+            "the fp_0 row never re-triggers the migration"
+        )
+
     def test_a_rewrite_that_fails_its_own_checks_is_rolled_back(self, db, monkeypatch):
         """The point of no return. A rewrite that would commit a corrupt catalogue
         must instead leave it byte-for-byte unchanged and fail the boot loudly."""

@@ -436,6 +436,14 @@ def signature_from_canonical_id(item_id):
         return None
 
 
+def is_unsignable_id(item_id):
+    return (
+        isinstance(item_id, str)
+        and len(item_id) == CANONICAL_ID_LEN
+        and item_id.startswith(_UNSIGNABLE_HEAD)
+    )
+
+
 def is_fingerprint_id(item_id):
     return isinstance(item_id, str) and item_id.startswith(_ID_PREFIX)
 

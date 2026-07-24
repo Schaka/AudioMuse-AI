@@ -305,6 +305,10 @@ if not _is_worker:
                 prefetched_durations=_relabel.get('server_durations'),
             ) or {}
         except Exception as _repair_exc:
+            # A thrown repair proves nothing ran to completion: mark it skipped so
+            # the migration-gated steps below (same-folder split, orphan purge) do
+            # not act on a catalogue whose migration state is unknown.
+            _repair = {'skipped': 'error'}
             app.logger.warning(
                 "Startup catalogue duplicate check failed (will retry next boot): %s",
                 _repair_exc,

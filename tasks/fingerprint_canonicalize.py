@@ -39,10 +39,18 @@ identity translation fallback.
 Main Features:
 * One-time, idempotent startup relabel of legacy rows. Content ids are hashed
   from embeddings a chunk at a time and dropped; duplicate candidates come from
-  the audio IVF clusters (``_ivf_candidate_pairs``) and are confirmed one bounded
-  slice at a time, so peak memory stays flat (one confirm slice) however crowded a
-  cluster is - a whole-catalogue pass over a homogeneous library used to run the
-  container out of memory. A track the IVF does not cover keeps its own id.
+  the audio IVF clusters (``_ivf_candidate_pairs``): only tracks sharing a cell
+  are paired, pairs whose stored lengths are unknown or incompatible are dropped
+  by a vectorized compare before any embedding is fetched (the confirm would
+  reject them anyway), and the survivors are confirmed one bounded slice at a
+  time. Peak memory is LINEAR in the library - small per-track structures (id,
+  cell and duration maps, ~tens of MB per 100k tracks) plus one bounded confirm
+  slice - and never grows with how crowded a cluster is (the PAIR count), which
+  is what used to run the container out of memory. A track the IVF does not
+  cover keeps its own id; a track whose embedding yields NO signature (constant
+  or non-finite) is relabelled to the same server-scoped fp_0 unsignable id
+  analysis would mint, mapped with the 'analysis' tier, and never proposed as a
+  merge partner - it can never fail the verifier as a leftover legacy row.
 * Cosine-confirmed duplicate merge into existing canonical rows.
 * Repoints the similarity indexes at the new ids in the same transaction: a
   relabel renames tracks without moving a vector, so nothing is re-clustered.
@@ -262,40 +270,7 @@ def _confirm_slice(fetch, ids, left_slice, right_slice, duration_of):
     return left_slice[confirmed], right_slice[confirmed]
 
 
-def _confirm_candidates(cur, ids, left, right, duration_of):
-    if left.size == 0:
-        return left, right
-    order = np.lexsort((right, left))
-    left = left[order]
-    right = right[order]
-    logger.info(
-        "Legacy catalogue migration: confirming %d candidate pairs in slices of %d "
-        "(resident block capped at ~%d MB)...",
-        left.size,
-        _CONFIRM_PAIRS,
-        (2 * _CONFIRM_PAIRS * simhash.SIGNATURE_BITS * 4) // (1024 * 1024),
-    )
-    kept_left = []
-    kept_right = []
-    fetch = cur.connection.cursor()
-    try:
-        for begin in range(0, left.size, _CONFIRM_PAIRS):
-            window = slice(begin, begin + _CONFIRM_PAIRS)
-            kept_l, kept_r = _confirm_slice(
-                fetch, ids, left[window], right[window], duration_of
-            )
-            if kept_l.size:
-                kept_left.append(kept_l)
-                kept_right.append(kept_r)
-    finally:
-        fetch.close()
-    if not kept_left:
-        empty = np.empty(0, dtype=np.int64)
-        return empty, empty
-    return np.concatenate(kept_left), np.concatenate(kept_right)
-
-
-def _ivf_candidate_pairs(cur, ids, loaded, provider_durations, source_id):
+def _ivf_candidate_pairs(cur, ids, valid, loaded, provider_durations, source_id):
     from .paged_ivf import IVF_DIR_TABLE, unpack_directory
     from .index_build_helpers import load_segmented_blob
 
@@ -310,7 +285,7 @@ def _ivf_candidate_pairs(cur, ids, loaded, provider_durations, source_id):
         )
         return empty, empty
     _centroids, id2cell, index_item_ids = unpack_directory(blob)[:3]
-    row_of = {ids[row]: row for row in range(loaded)}
+    row_of = {ids[row]: row for row in range(loaded) if valid[row]}
     cell_of_row = []
     rows_present = []
     for vec_id, item_id in enumerate(index_item_ids):
@@ -333,6 +308,11 @@ def _ivf_candidate_pairs(cur, ids, loaded, provider_durations, source_id):
     group_of_pos = np.repeat(np.arange(sizes.size), sizes)
     involved = order[crowded[group_of_pos]]
     duration_of = _durations_for_rows(cur, ids, involved, provider_durations, source_id)
+    row_duration = np.full(loaded, np.nan)
+    for item_id, value in duration_of.items():
+        row = row_of.get(item_id)
+        if row is not None and value is not None:
+            row_duration[row] = value
     logger.info(
         "Legacy catalogue migration: %d IVF cluster(s) hold multiple tracks; "
         "confirming duplicates within each cluster (slices of %d)...",
@@ -340,19 +320,52 @@ def _ivf_candidate_pairs(cur, ids, loaded, provider_durations, source_id):
     )
     kept_left = []
     kept_right = []
+    pending_first = []
+    pending_second = []
+    pending = 0
     fetch = conn.cursor()
+
+    def _flush():
+        nonlocal pending
+        if not pending_first:
+            return
+        kept_l, kept_r = _confirm_slice(
+            fetch, ids,
+            np.concatenate(pending_first), np.concatenate(pending_second),
+            duration_of,
+        )
+        pending_first.clear()
+        pending_second.clear()
+        pending = 0
+        if kept_l.size:
+            kept_left.append(kept_l)
+            kept_right.append(kept_r)
+
     try:
         for first, second in simhash._iter_group_pairs(
             order, starts[crowded], sizes[crowded], limit=_CONFIRM_PAIRS
         ):
-            kept_l, kept_r = _confirm_slice(
-                fetch, ids,
-                first.astype(np.int64), second.astype(np.int64),
-                duration_of,
-            )
-            if kept_l.size:
-                kept_left.append(kept_l)
-                kept_right.append(kept_r)
+            first = first.astype(np.int64)
+            second = second.astype(np.int64)
+            left_durations = row_duration[first]
+            right_durations = row_duration[second]
+            with np.errstate(invalid='ignore'):
+                compatible = (
+                    np.isfinite(left_durations)
+                    & np.isfinite(right_durations)
+                    & (left_durations > 0)
+                    & (right_durations > 0)
+                    & (np.abs(left_durations - right_durations)
+                       <= config.DURATION_TOLERANCE_SECONDS)
+                )
+            if not compatible.any():
+                continue
+            pending_first.append(first[compatible])
+            pending_second.append(second[compatible])
+            pending += int(compatible.sum())
+            if pending >= _CONFIRM_PAIRS:
+                _flush()
+        _flush()
     finally:
         fetch.close()
     if not kept_left:
@@ -490,7 +503,7 @@ def _build_mapping(cur, source_id):
     resolved_at = time.monotonic()
 
     left, right = _ivf_candidate_pairs(
-        cur, ids, loaded, provider_durations, source_id
+        cur, ids, valid, loaded, provider_durations, source_id
     )
     # A canonical row may only ever be a merge TARGET, never a child. merge_pairs
     # refuses a merge whose target has itself already merged, so a confirmed
@@ -510,10 +523,13 @@ def _build_mapping(cur, source_id):
     duplicate_mapping = {}
     canonical_of = dict(enumerate(ids[:canonical_loaded]))
     taken = set(ids[:canonical_loaded])
+    unsignable = 0
     for row in range(canonical_loaded, loaded):
-        if not valid[row]:
-            continue
         legacy_id = ids[row]
+        if not valid[row]:
+            mapping[legacy_id] = simhash.unsignable_canonical_id(source_id, legacy_id)
+            unsignable += 1
+            continue
         target = int(parent[row])
         if target != row:
             duplicate_mapping[legacy_id] = canonical_of[target]
@@ -522,6 +538,13 @@ def _build_mapping(cur, source_id):
         canonical_of[row] = minted
         taken.add(minted)
         mapping[legacy_id] = minted
+    if unsignable:
+        logger.warning(
+            "Legacy catalogue migration: %d track(s) have no usable embedding "
+            "signature (constant or non-finite embedding); catalogued under "
+            "server-scoped fp_0 ids, excluded from duplicate matching.",
+            unsignable,
+        )
     logger.info(
         "Legacy catalogue migration: resolved %d tracks in %.1fs "
         "(%d new content ids, %d duplicates merged).",
@@ -676,12 +699,14 @@ def _copy_track_server_map(cur, source_id, all_changes, default_provider_ids,
         provider_id = str(default_provider_ids.get(str(old_id), str(old_id)))
         path = legacy_paths.get(str(old_id))
         duration = provider_durations.get(provider_id)
+        tier = 'analysis' if simhash.is_unsignable_id(canonical) else 'default'
         buffer.write(
-            "%s\t%s\t%s\t%s\t%s\n"
+            "%s\t%s\t%s\t%s\t%s\t%s\n"
             % (
                 canonical.replace('\t', ' '),
                 source_id,
                 _copy_escape(provider_id),
+                tier,
                 r'\N' if not path else _copy_escape(path),
                 r'\N' if duration is None else repr(float(duration)),
             )
@@ -689,22 +714,23 @@ def _copy_track_server_map(cur, source_id, all_changes, default_provider_ids,
     buffer.seek(0)
     cur.execute(
         "CREATE TEMP TABLE incoming_default_map "
-        "(item_id TEXT, server_id TEXT, provider_track_id TEXT, file_path TEXT, "
-        "duration DOUBLE PRECISION) "
+        "(item_id TEXT, server_id TEXT, provider_track_id TEXT, match_tier TEXT, "
+        "file_path TEXT, duration DOUBLE PRECISION) "
         "ON COMMIT DROP"
     )
     cur.copy_expert(
         "COPY incoming_default_map "
-        "(item_id, server_id, provider_track_id, file_path, duration) "
+        "(item_id, server_id, provider_track_id, match_tier, file_path, duration) "
         "FROM STDIN",
         buffer,
     )
     cur.execute(
         "INSERT INTO track_server_map "
         "(item_id, server_id, provider_track_id, match_tier, file_path, updated_at) "
-        "SELECT item_id, server_id, provider_track_id, 'default', file_path, now() "
+        "SELECT item_id, server_id, provider_track_id, match_tier, file_path, now() "
         "FROM incoming_default_map "
         "ON CONFLICT (server_id, provider_track_id) DO UPDATE SET "
+        "match_tier = EXCLUDED.match_tier, "
         "file_path = COALESCE(EXCLUDED.file_path, track_server_map.file_path)"
     )
     cur.execute(

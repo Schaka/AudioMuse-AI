@@ -59,6 +59,12 @@ Main Features:
   bound to no server (false-merge splits plus pre-existing orphans), so the
   catalogue is clean after a migration; embeddings cascade, per-file Chromaprints
   are kept, and each deleted track re-analyzes under its own id if its file returns.
+  It needs no complete-listing guard (unlike the cleaning pass): it never interprets
+  a server listing, only the map table itself, and an unreachable server keeps its
+  map rows, so a track still on any server is never purged. The one accepted window
+  is a concurrently analyzing track between its score insert and its map flush on
+  the migration boot itself - hitting it costs that track one re-analysis, nothing
+  more.
 """
 
 import logging
