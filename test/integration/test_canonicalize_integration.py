@@ -18,8 +18,10 @@ Main Features:
 * A legacy catalogue is relabelled for real: provider ids become content ids,
   the provider ids survive in track_server_map, and the legacy score.file_path
   moves onto the server's own map row.
-* Identical audio with matching duration merges into ONE catalogue row and the
-  merged row keeps its path; a different or unknown duration always splits.
+* Duplicate candidates come from the audio IVF cluster directory (seeded here):
+  identical audio in one cluster with matching duration merges into ONE catalogue
+  row and keeps its path; a different or unknown duration splits; and a track the
+  index does not cover - or a missing index entirely - merges nothing (fail-safe).
 * The verification gate ROLLS BACK a rewrite that violates its invariants, leaving
   the catalogue byte-for-byte as it was.
 * The embedding cascade is re-added even when no constraint existed to find.
@@ -63,10 +65,16 @@ _SCHEMA = [
     "provider_track_id TEXT NOT NULL, match_tier TEXT, file_path TEXT, "
     "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
     "PRIMARY KEY (server_id, provider_track_id))",
+    "CREATE TABLE chromaprint ("
+    "server_id TEXT NOT NULL REFERENCES music_servers (server_id) ON DELETE CASCADE, "
+    "provider_track_id TEXT NOT NULL, fingerprint BYTEA, "
+    "updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, "
+    "PRIMARY KEY (server_id, provider_track_id))",
     "CREATE TABLE map_projection_data (index_name VARCHAR(255) PRIMARY KEY, "
     "projection_data BYTEA NOT NULL, id_map_json TEXT NOT NULL, "
     "embedding_dimension INTEGER NOT NULL)",
-    "CREATE TABLE ivf_dir (name TEXT PRIMARY KEY, blob_data BYTEA NOT NULL)",
+    "CREATE TABLE ivf_dir (name TEXT PRIMARY KEY, blob_data BYTEA NOT NULL, "
+    "created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)",
 ]
 
 _EMBEDDING_FK = (
@@ -113,7 +121,7 @@ def _build(conn, tracks, embedding_ddl=_EMBEDDING_FK):
     startup migration has ever run."""
     with conn.cursor() as cur:
         cur.execute(
-            "DROP TABLE IF EXISTS track_server_map, music_servers, embedding, "
+            "DROP TABLE IF EXISTS chromaprint, track_server_map, music_servers, embedding, "
             "clap_embedding, lyrics_embedding, playlist, map_projection_data, "
             "ivf_dir, score CASCADE"
         )
@@ -134,6 +142,28 @@ def _build(conn, tracks, embedding_ddl=_EMBEDDING_FK):
                 (item_id, psycopg2.Binary(vector.astype(np.float32).tobytes())),
             )
     conn.commit()
+
+
+def _seed_ivf(conn, entries):
+    from tasks.paged_ivf import pack_directory
+    import config as cfg
+
+    item_ids = [item_id for item_id, _cell in entries]
+    id2cell = np.array([cell for _item_id, cell in entries], dtype=np.uint32)
+    n_cells = int(id2cell.max()) + 1 if id2cell.size else 1
+    centroids = np.zeros((n_cells, simhash.SIGNATURE_BITS), dtype=np.float32)
+    blob = pack_directory(centroids, id2cell, item_ids, simhash.SIGNATURE_BITS, 'angular')
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO ivf_dir (name, blob_data) VALUES (%s, %s) "
+            "ON CONFLICT (name) DO UPDATE SET blob_data = EXCLUDED.blob_data",
+            ('%s__ivf_dir' % cfg.INDEX_NAME, psycopg2.Binary(blob)),
+        )
+    conn.commit()
+
+
+def _seed_ivf_all(conn, tracks):
+    _seed_ivf(conn, [(item_id, 0) for item_id, _path, _vec in tracks])
 
 
 def _score(conn):
@@ -242,10 +272,12 @@ class TestRealCanonicalization:
     ):
         from tasks import fingerprint_canonicalize as fc
 
+        # jf-2 sits within the length tolerance of jf-1, whatever the tolerance is.
+        tol = fc.config.DURATION_TOLERANCE_SECONDS
         monkeypatch.setattr(
             fc,
             '_fetch_provider_durations',
-            lambda source_id, conn: {'jf-1': 200.0, 'jf-2': 201.5, 'jf-3': 300.0},
+            lambda source_id, conn: {'jf-1': 200.0, 'jf-2': 200.0 + tol, 'jf-3': 300.0},
         )
         same = _distinct_embedding(7)
         tracks = [
@@ -254,6 +286,7 @@ class TestRealCanonicalization:
             ('jf-3', '/music/Other/03.flac', _distinct_embedding(9)),
         ]
         _build(db, tracks)
+        _seed_ivf_all(db, tracks)
 
         result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
 
@@ -282,6 +315,40 @@ class TestRealCanonicalization:
                 "the migration must backfill score.duration from the server metadata"
             )
 
+    def test_same_folder_files_never_share_an_id_during_canonicalize(self, db, monkeypatch):
+        from tasks import fingerprint_canonicalize as fc
+
+        # jf-1 and jf-3 are DIFFERENT songs that happen to sit in the SAME folder;
+        # both are near-identical to jf-2 in another folder. Folding the folder rule
+        # into the id calculation must keep jf-1 and jf-3 on separate ids in this
+        # one pass - never form the merge and then unmap it (which would orphan a row).
+        monkeypatch.setattr(
+            fc, '_fetch_provider_durations',
+            lambda source_id, conn: {'jf-1': 200.0, 'jf-2': 200.0, 'jf-3': 200.0},
+        )
+        same = _distinct_embedding(11)
+        tracks = [
+            ('jf-1', '/music/Album/01.flac', same),
+            ('jf-2', '/music/Other/02.flac', same.copy()),
+            ('jf-3', '/music/Album/03.flac', same.copy()),
+        ]
+        _build(db, tracks)
+        _seed_ivf_all(db, tracks)
+
+        result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        assert result['duplicates'] == 1, "only the cross-folder file may merge"
+        assert len(_score(db)) == 2
+        maps = {p: item for p, item, _path in _maps(db)}
+        assert set(maps) == {'jf-1', 'jf-2', 'jf-3'}, "every file stays mapped (no orphan)"
+        assert maps['jf-1'] != maps['jf-3'], "same-folder files must not share an id"
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM score s WHERE NOT EXISTS "
+                "(SELECT 1 FROM track_server_map t WHERE t.item_id = s.item_id)"
+            )
+            assert cur.fetchone()[0] == 0, "no catalogue row is left orphaned"
+
     def test_same_sounding_audio_with_different_length_stays_two_songs(
         self, db, monkeypatch
     ):
@@ -298,6 +365,7 @@ class TestRealCanonicalization:
             ('jf-2', '/music/Arrau/nocturne.flac', same.copy()),
         ]
         _build(db, tracks)
+        _seed_ivf_all(db, tracks)
 
         result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
 
@@ -320,6 +388,7 @@ class TestRealCanonicalization:
             ('jf-2', '/music/Best Of/07 Rio.flac', same.copy()),
         ]
         _build(db, tracks)
+        _seed_ivf_all(db, tracks)
 
         result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
 
@@ -327,6 +396,246 @@ class TestRealCanonicalization:
             "without durations nothing can be proven identical, so nothing merges"
         )
         assert len(_score(db)) == 2
+
+    def test_without_an_ivf_index_every_track_stays_unique(self, db, monkeypatch):
+        from tasks import fingerprint_canonicalize as fc
+
+        monkeypatch.setattr(
+            fc, '_fetch_provider_durations',
+            lambda source_id, conn: {'jf-1': 200.0, 'jf-2': 200.0},
+        )
+        same = _distinct_embedding(7)
+        tracks = [
+            ('jf-1', '/music/Album/01 Rio.flac', same),
+            ('jf-2', '/music/Best Of/07 Rio.flac', same.copy()),
+        ]
+        _build(db, tracks)
+
+        result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        assert result['duplicates'] == 0, (
+            "with no IVF index there are no clusters to compare, so nothing merges"
+        )
+        assert len(_score(db)) == 2
+        assert {p for p, _i, _f in _maps(db)} == {'jf-1', 'jf-2'}, "both files stay mapped"
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM score s WHERE NOT EXISTS "
+                "(SELECT 1 FROM track_server_map t WHERE t.item_id = s.item_id)"
+            )
+            assert cur.fetchone()[0] == 0, "the fail-safe leaves no orphan"
+
+    def test_a_track_missing_from_the_ivf_index_stays_unique_while_others_merge(
+        self, db, monkeypatch
+    ):
+        from tasks import fingerprint_canonicalize as fc
+
+        monkeypatch.setattr(
+            fc, '_fetch_provider_durations',
+            lambda source_id, conn: {'jf-1': 200.0, 'jf-2': 200.0, 'jf-3': 200.0},
+        )
+        same = _distinct_embedding(7)
+        tracks = [
+            ('jf-1', '/music/Album/01.flac', same),
+            ('jf-2', '/music/Best Of/07.flac', same.copy()),
+            ('jf-3', '/music/Live/03.flac', same.copy()),
+        ]
+        _build(db, tracks)
+        _seed_ivf(db, [('jf-1', 0), ('jf-2', 0)])
+
+        result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        assert result['duplicates'] == 1, "the two indexed copies merge"
+        assert len(_score(db)) == 2, "jf-3 is not in the index, so it keeps its own id"
+        by_provider = {p: item for p, item, _f in _maps(db)}
+        assert by_provider['jf-1'] == by_provider['jf-2']
+        assert by_provider['jf-3'] != by_provider['jf-1'], (
+            "a track missing from the index is never merged"
+        )
+
+    def test_unsignable_embeddings_never_propose_or_receive_merges(self, db):
+        from tasks import fingerprint_canonicalize as fc
+
+        flat = np.full(simhash.SIGNATURE_BITS, 0.5, dtype=np.float32)
+        near_flat = flat.copy()
+        near_flat[0] += 1e-3
+        same = _distinct_embedding(7)
+        tracks = [
+            ('jf-flat', '/music/A/tone.flac', flat),
+            ('jf-nearflat', '/music/B/tone2.flac', near_flat),
+            ('jf-r1', '/music/C/song.flac', same),
+            ('jf-r2', '/music/D/song.flac', same.copy()),
+        ]
+        _build(db, tracks)
+        _seed_ivf_all(db, tracks)
+        with db.cursor() as cur:
+            cur.execute("UPDATE score SET duration = 200.0")
+        db.commit()
+
+        ids = [item_id for item_id, _path, _vec in tracks]
+        valid = np.array(
+            [simhash.embedding_signature(vec) is not None for _i, _p, vec in tracks]
+        )
+        assert not valid[0], "precondition: a constant embedding has no signature"
+        assert valid[1:].all()
+
+        with db.cursor() as cur:
+            left, right = fc._ivf_candidate_pairs(cur, ids, valid, len(ids), {}, 'srv')
+
+        pairs = set(zip(left.tolist(), right.tolist()))
+        assert pairs == {(2, 3)}, (
+            "only the two real copies pair; the signatureless constant embedding "
+            "proposes nothing and receives nothing, even though its cosine to the "
+            "near-constant track is ~1.0"
+        )
+
+    def test_a_constant_embedding_row_migrates_to_fp0_and_cannot_brick_the_boot(
+        self, db, monkeypatch
+    ):
+        from tasks import fingerprint_canonicalize as fc
+
+        monkeypatch.setattr(
+            fc, '_fetch_provider_durations',
+            lambda source_id, conn: {'jf-flat': 90.0, 'jf-1': 200.0, 'jf-2': 200.0},
+        )
+        flat = np.full(simhash.SIGNATURE_BITS, 0.5, dtype=np.float32)
+        same = _distinct_embedding(7)
+        tracks = [
+            ('jf-flat', '/music/T/tone.flac', flat),
+            ('jf-1', '/music/A/song.flac', same),
+            ('jf-2', '/music/B/song.flac', same.copy()),
+        ]
+        _build(db, tracks)
+        _seed_ivf_all(db, tracks)
+
+        result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        assert result['relabelled'] == 3
+        assert result['duplicates'] == 1
+        expected = simhash.unsignable_canonical_id('srv', 'jf-flat')
+        assert expected.startswith('fp_0')
+        maps = {p: item for p, item, _f in _maps(db)}
+        assert maps['jf-flat'] == expected, (
+            "the signatureless track gets the SAME server-scoped fp_0 id "
+            "analysis would mint for it"
+        )
+        assert maps['jf-1'] == maps['jf-2'], "the real duplicate still merges"
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT match_tier FROM track_server_map "
+                "WHERE provider_track_id = 'jf-flat'"
+            )
+            assert cur.fetchone()[0] == 'analysis', (
+                "the analysis tier is what exempts fp_0 rows from the legacy count"
+            )
+            cur.execute(
+                "SELECT count(*) FROM embedding WHERE item_id = %s", (expected,)
+            )
+            assert cur.fetchone()[0] == 1, "its analysis rows follow the relabel"
+
+        second = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+        assert second == {'relabelled': 0, 'duplicates': 0}, (
+            "the fp_0 row never re-triggers the migration"
+        )
+
+    def test_no_corruption_shape_of_the_embedding_can_brick_the_migration(self, db):
+        from tasks import fingerprint_canonicalize as fc
+
+        tracks = [
+            ('jf-missing', '/music/A/01.flac', _distinct_embedding(1)),
+            ('jf-null', '/music/B/02.flac', _distinct_embedding(2)),
+            ('jf-truncated', '/music/C/03.flac', _distinct_embedding(3)),
+            ('jf-wrong-size', '/music/D/04.flac', _distinct_embedding(4)),
+            ('jf-ok', '/music/E/05.flac', _distinct_embedding(5)),
+        ]
+        _build(db, tracks)
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM embedding WHERE item_id = 'jf-missing'")
+            cur.execute("UPDATE embedding SET embedding = NULL WHERE item_id = 'jf-null'")
+            cur.execute(
+                "UPDATE embedding SET embedding = %s WHERE item_id = 'jf-truncated'",
+                (psycopg2.Binary(b'\x00\x01\x02'),),
+            )
+            cur.execute(
+                "UPDATE embedding SET embedding = %s WHERE item_id = 'jf-wrong-size'",
+                (psycopg2.Binary(np.zeros(10, dtype=np.float32).tobytes()),),
+            )
+        db.commit()
+
+        result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        assert result['relabelled'] == 5, "every corruption shape still relabels"
+        maps = {p: item for p, item, _f in _maps(db)}
+        for provider in ('jf-missing', 'jf-null', 'jf-truncated', 'jf-wrong-size'):
+            assert maps[provider] == simhash.unsignable_canonical_id('srv', provider)
+        assert maps['jf-ok'].startswith(simhash.CURRENT_ID_HEAD)
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM track_server_map WHERE match_tier = 'analysis'"
+            )
+            assert cur.fetchone()[0] == 4
+        second = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+        assert second == {'relabelled': 0, 'duplicates': 0}, (
+            "no corruption shape leaves a legacy id behind to re-run the migration"
+        )
+
+    def test_unsignable_fp0_uses_the_source_servers_provider_id_when_mapped(self, db):
+        from tasks import fingerprint_canonicalize as fc
+
+        flat = np.full(simhash.SIGNATURE_BITS, 0.5, dtype=np.float32)
+        tracks = [
+            ('old-key', '/music/T/tone.flac', flat),
+            ('jf-1', '/music/A/song.flac', _distinct_embedding(1)),
+        ]
+        _build(db, tracks)
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO track_server_map "
+                "(item_id, server_id, provider_track_id, match_tier) "
+                "VALUES ('old-key', 'srv', 'nav-123', 'default')"
+            )
+        db.commit()
+
+        fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        expected = simhash.unsignable_canonical_id('srv', 'nav-123')
+        maps = {p: item for p, item, _f in _maps(db)}
+        assert maps['nav-123'] == expected, (
+            "the fp_0 id is minted from the server's REAL provider id, not the "
+            "legacy score key, so a later re-analysis resolves to the same row"
+        )
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT match_tier FROM track_server_map "
+                "WHERE provider_track_id = 'nav-123'"
+            )
+            assert cur.fetchone()[0] == 'analysis'
+        second = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+        assert second == {'relabelled': 0, 'duplicates': 0}
+
+    def test_relabel_preserves_an_existing_provider_migration_tier(self, db):
+        from tasks import fingerprint_canonicalize as fc
+
+        tracks = [('jf-1', '/music/A/song.flac', _distinct_embedding(1))]
+        _build(db, tracks)
+        with db.cursor() as cur:
+            cur.execute(
+                "INSERT INTO track_server_map "
+                "(item_id, server_id, provider_track_id, match_tier) "
+                "VALUES ('jf-1', 'srv', 'jf-1', 'exact')"
+            )
+        db.commit()
+
+        fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT match_tier FROM track_server_map "
+                "WHERE provider_track_id = 'jf-1'"
+            )
+            assert cur.fetchone()[0] == 'exact', (
+                "a signable row's relabel must not clobber the stored match tier"
+            )
 
     def test_a_rewrite_that_fails_its_own_checks_is_rolled_back(self, db, monkeypatch):
         """The point of no return. A rewrite that would commit a corrupt catalogue

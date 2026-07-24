@@ -295,19 +295,52 @@ if not _is_worker:
         # table-derived (score.duration), so it is an instant no-op after the
         # legacy migration and after its own first pass - no stored flag that a
         # config cleanup could wipe, no second duration fetch on a legacy upgrade.
+        _repair = {}
         try:
             from tasks.duplicate_repair import repair_duplicate_track_maps
             # Reuse the whole-server listing the legacy migration just did so a
             # mixed upgrade (provider ids plus leftover older-scheme rows) does not
             # list the same server twice on one boot - its only slow step.
-            repair_duplicate_track_maps(
+            _repair = repair_duplicate_track_maps(
                 prefetched_durations=_relabel.get('server_durations'),
-            )
+            ) or {}
         except Exception as _repair_exc:
+            # A thrown repair proves nothing ran to completion: mark it skipped so
+            # the migration-gated steps below (same-folder split, orphan purge) do
+            # not act on a catalogue whose migration state is unknown.
+            _repair = {'skipped': 'error'}
             app.logger.warning(
                 "Startup catalogue duplicate check failed (will retry next boot): %s",
                 _repair_exc,
             )
+
+        # Split any merge that grouped two distinct files from the SAME folder (an
+        # album never holds one recording twice). The migration paths already reject
+        # same-folder pairs as they resolve; this group-level pass catches the few
+        # transitive leftovers. It is GATED on a scheme migration having actually run
+        # this boot (older-scheme rows existed) - so once everything is on the current
+        # scheme it never runs and never scans track_server_map on a steady-state boot.
+        _migration_happened = bool(_relabel.get('relabelled')) or 'skipped' not in _repair
+        if _migration_happened:
+            try:
+                from tasks.duplicate_repair import split_same_folder_merges
+                split_same_folder_merges()
+            except Exception as _folder_exc:
+                app.logger.warning(
+                    "Startup same-folder cleanup failed (will retry next boot): %s",
+                    _folder_exc,
+                )
+            # Leave a clean catalogue after a migration: delete every row a false
+            # split (or a prior run) left bound to no server, so re-analysis re-creates
+            # it under its own id rather than stranding an orphan.
+            try:
+                from tasks.duplicate_repair import purge_orphan_catalogue_rows
+                purge_orphan_catalogue_rows()
+            except Exception as _purge_exc:
+                app.logger.warning(
+                    "Startup migration orphan purge failed (will retry next boot): %s",
+                    _purge_exc,
+                )
 
         # Finalize JWT_SECRET - must happen after DB init so the value can be
         # persisted and shared across all gunicorn workers.

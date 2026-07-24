@@ -15,34 +15,44 @@ legacy row, at Flask container startup, and is an instant no-op afterwards;
 analysis mints canonical ids directly at analyze time so nothing here runs
 during analysis. It is NOT once per lifetime of an INSTALL: identity is derived
 from the MusiCNN embedding, so swapping the model re-mints every id and runs the
-whole rewrite again. Signatures are hashed a chunk at a time and the candidate
-scan fans its independent bands across threads, so a large legacy install
-migrates as fast as the machine allows without ever holding the whole catalogue
-in memory. The rewrite uses the same proven transactional key-rewrite the
-provider-migration feature uses (score, playlist, and all embedding tables,
-with the embedding foreign keys dropped and re-added around it). A legacy row
-merges into an existing catalogue row ONLY when its signature is within
-tolerance AND the exact raw-embedding cosine confirms it is the same audio
+whole rewrite again. Signatures are hashed a chunk at a time to mint each row's
+content id, and duplicate candidates are read straight from the audio IVF index
+the library already built - only tracks sharing an IVF cell (cluster) are
+compared - so a large legacy install migrates without ever holding the whole
+catalogue's pairs in memory. The rewrite uses the same proven transactional
+key-rewrite the provider-migration feature uses (score, playlist, and all
+embedding tables, with the embedding foreign keys dropped and re-added around
+it). A legacy row merges into an existing catalogue row ONLY when they share an
+IVF cluster AND the exact raw-embedding cosine confirms it is the same audio
 (the Similar Songs duplicate rule) AND the two track durations agree within
 DURATION_TOLERANCE_SECONDS - a homogeneous library (say, solo piano) puts
 genuinely different recordings inside the cosine threshold, and only the
 length tells them apart. Durations come from ONE paged metadata listing of
 the source server (no audio downloads) and are backfilled into
 score.duration; if the server is unreachable the migration still runs and
-simply merges nothing, which is always safe. The source server's real ids
-are preserved in track_server_map so output can be translated back; rows
-without an embedding keep their provider id and keep working via the
-identity translation fallback.
+simply merges nothing, which is always safe (an absent IVF index does the
+same, and a track the index does not cover keeps its own id). The source server's real ids
+are preserved in track_server_map so output can be translated back; a row
+whose embedding is missing or unusable (NULL, truncated, wrong size, constant,
+non-finite) is relabelled to the server-scoped fp_0 unsignable id and mapped
+with the 'analysis' tier, so no corruption shape can leave a legacy id behind
+to fail the verifier and re-run the migration forever.
 
 Main Features:
-* One-time, idempotent startup relabel of legacy rows, resolved for the whole
-  catalogue in vectorized BATCHES: embeddings are hashed a chunk at a time and
-  dropped, and candidate pairs stream in bounded slices (a 188k-track library
-  migrates end to end in ~80s, where the per-track loop this replaces took ~10
-  minutes and a whole-catalogue pass ran the container out of memory). Peak
-  memory is LINEAR in the library, not constant: 25 B per track for the
-  signatures, plus one ``(matched_tracks, 200)`` float32 array that
-  ``_confirm_candidates`` allocates up front.
+* One-time, idempotent startup relabel of legacy rows. Content ids are hashed
+  from embeddings a chunk at a time and dropped; duplicate candidates come from
+  the audio IVF clusters (``_ivf_candidate_pairs``): only tracks sharing a cell
+  are paired, pairs whose stored lengths are unknown or incompatible are dropped
+  by a vectorized compare before any embedding is fetched (the confirm would
+  reject them anyway), and the survivors are confirmed one bounded slice at a
+  time. Peak memory is LINEAR in the library - small per-track structures (id,
+  cell and duration maps, ~tens of MB per 100k tracks) plus one bounded confirm
+  slice - and never grows with how crowded a cluster is (the PAIR count), which
+  is what used to run the container out of memory. A track the IVF does not
+  cover keeps its own id; a track whose embedding yields NO signature (constant
+  or non-finite) is relabelled to the same server-scoped fp_0 unsignable id
+  analysis would mint, mapped with the 'analysis' tier, and never proposed as a
+  merge partner - it can never fail the verifier as a leftover legacy row.
 * Cosine-confirmed duplicate merge into existing canonical rows.
 * Repoints the similarity indexes at the new ids in the same transaction: a
   relabel renames tracks without moving a vector, so nothing is re-clustered.
@@ -127,10 +137,10 @@ def _hash_catalogue(cur, sql, params, ids, packed, valid, offset):
             batch = np.zeros((len(rows), simhash.SIGNATURE_BITS), dtype=np.float32)
             kept = 0
             for item_id, blob in rows:
-                vector = np.frombuffer(blob, dtype=np.float32)
-                if vector.size != simhash.SIGNATURE_BITS:
-                    continue
-                batch[kept] = vector
+                if blob is not None and len(blob) % 4 == 0:
+                    vector = np.frombuffer(blob, dtype=np.float32)
+                    if vector.size == simhash.SIGNATURE_BITS:
+                        batch[kept] = vector
                 ids.append(str(item_id))
                 kept += 1
             if not kept:
@@ -215,68 +225,177 @@ def _durations_for_rows(cur, ids, rows, provider_durations, source_id):
     return durations
 
 
-def _confirm_candidates(cur, ids, left, right, duration_of):
-    """Keep the candidate pairs the EXACT raw-embedding cosine confirms.
+def _confirm_slice(fetch, ids, left_slice, right_slice, duration_of):
+    rows = np.unique(np.concatenate((left_slice, right_slice)))
+    vectors = np.zeros((rows.size, simhash.SIGNATURE_BITS), dtype=np.float32)
+    slot_of = {ids[int(row)]: slot for slot, row in enumerate(rows)}
+    fingerprint_of = {}
+    for chunk in range(0, rows.size, _CHUNK_ROWS):
+        wanted = [ids[int(row)] for row in rows[chunk:chunk + _CHUNK_ROWS]]
+        fetch.execute(
+            "SELECT item_id, embedding FROM embedding WHERE item_id = ANY(%s)",
+            (wanted,),
+        )
+        for item_id, blob in fetch.fetchall():
+            vector = np.frombuffer(blob, dtype=np.float32)
+            if vector.size == simhash.SIGNATURE_BITS:
+                vectors[slot_of[str(item_id)]] = vector
+        if config.CHROMAPRINT_GATE_ENABLED:
+            fetch.execute(
+                "SELECT DISTINCT ON (m.item_id) m.item_id, c.fingerprint "
+                "FROM track_server_map m JOIN chromaprint c "
+                "ON c.server_id = m.server_id "
+                "AND c.provider_track_id = m.provider_track_id "
+                "WHERE m.item_id = ANY(%s) AND c.fingerprint IS NOT NULL",
+                (wanted,),
+            )
+            for item_id, blob in fetch.fetchall():
+                if blob is not None:
+                    fingerprint_of[str(item_id)] = bytes(blob)
+    confirmed = simhash.confirm_pairs(
+        vectors[np.searchsorted(rows, left_slice)],
+        vectors[np.searchsorted(rows, right_slice)],
+        left_durations=[duration_of.get(ids[int(row)]) for row in left_slice],
+        right_durations=[duration_of.get(ids[int(row)]) for row in right_slice],
+        left_fingerprints=(
+            [fingerprint_of.get(ids[int(row)]) for row in left_slice]
+            if fingerprint_of else None
+        ),
+        right_fingerprints=(
+            [fingerprint_of.get(ids[int(row)]) for row in right_slice]
+            if fingerprint_of else None
+        ),
+    )
+    if not confirmed.any():
+        empty = np.empty(0, dtype=left_slice.dtype)
+        return empty, empty
+    return left_slice[confirmed], right_slice[confirmed]
 
-    Bounded memory, whatever the library's size. The embeddings are read back one
-    SLICE of pairs at a time, so the resident float32 block is capped by the slice
-    (at most ``2 * _CONFIRM_PAIRS`` tracks, ~80 MB) instead of by the number of
-    tracks a signature happened to match, which is what a whole-catalogue array
-    made linear in the library and is how this once ran a container out of memory.
 
-    The pairs are lexsorted first, so the tracks a slice touches are contiguous and
-    a track that neighbours many others is re-read a handful of times rather than
-    once per pair it appears in.
-    """
-    if left.size == 0:
-        return left, right
-    order = np.lexsort((right, left))
-    left = left[order]
-    right = right[order]
+def _ivf_candidate_pairs(cur, ids, valid, loaded, provider_durations, source_id):
+    from .paged_ivf import IVF_DIR_TABLE, unpack_directory
+    from .index_build_helpers import load_segmented_blob
+
+    empty = np.empty(0, dtype=np.int64)
+    conn = cur.connection
+    blob = load_segmented_blob(conn, IVF_DIR_TABLE, "%s__ivf_dir" % config.INDEX_NAME)
+    if not blob:
+        logger.warning(
+            "Legacy catalogue migration: no audio IVF index found; every legacy "
+            "track keeps its own id (no duplicate merging this run). Rebuild the "
+            "similarity index (run analysis) and restart to merge duplicates."
+        )
+        return empty, empty
+    _centroids, id2cell, index_item_ids = unpack_directory(blob)[:3]
+    row_of = {ids[row]: row for row in range(loaded) if valid[row]}
+    cell_of_row = []
+    rows_present = []
+    for vec_id, item_id in enumerate(index_item_ids):
+        row = row_of.get(item_id)
+        if row is not None:
+            cell_of_row.append(int(id2cell[vec_id]))
+            rows_present.append(row)
+    if len(rows_present) < 2:
+        return empty, empty
+    cells = np.asarray(cell_of_row, dtype=np.int64)
+    rows_arr = np.asarray(rows_present, dtype=np.int64)
+    order_pos = np.argsort(cells, kind="stable")
+    order = rows_arr[order_pos]
+    _uniq, starts, sizes = np.unique(
+        cells[order_pos], return_index=True, return_counts=True
+    )
+    crowded = sizes > 1
+    if not crowded.any():
+        return empty, empty
+    group_of_pos = np.repeat(np.arange(sizes.size), sizes)
+    involved = order[crowded[group_of_pos]]
+    duration_of = _durations_for_rows(cur, ids, involved, provider_durations, source_id)
+    row_duration = np.full(loaded, np.nan)
+    for item_id, value in duration_of.items():
+        row = row_of.get(item_id)
+        if row is not None and value is not None:
+            row_duration[row] = value
     logger.info(
-        "Legacy catalogue migration: confirming %d candidate pairs in slices of %d "
-        "(resident block capped at ~%d MB)...",
-        left.size,
-        _CONFIRM_PAIRS,
-        (2 * _CONFIRM_PAIRS * simhash.SIGNATURE_BITS * 4) // (1024 * 1024),
+        "Legacy catalogue migration: %d IVF cluster(s) hold multiple tracks; "
+        "confirming duplicates within each cluster (slices of %d)...",
+        int(crowded.sum()), _CONFIRM_PAIRS,
     )
     kept_left = []
     kept_right = []
-    fetch = cur.connection.cursor()
+    pending_first = []
+    pending_second = []
+    pending = 0
+    fetch = conn.cursor()
+
+    def _flush():
+        nonlocal pending
+        if not pending_first:
+            return
+        kept_l, kept_r = _confirm_slice(
+            fetch, ids,
+            np.concatenate(pending_first), np.concatenate(pending_second),
+            duration_of,
+        )
+        pending_first.clear()
+        pending_second.clear()
+        pending = 0
+        if kept_l.size:
+            kept_left.append(kept_l)
+            kept_right.append(kept_r)
+
     try:
-        for begin in range(0, left.size, _CONFIRM_PAIRS):
-            window = slice(begin, begin + _CONFIRM_PAIRS)
-            left_slice = left[window]
-            right_slice = right[window]
-            rows = np.unique(np.concatenate((left_slice, right_slice)))
-            vectors = np.zeros((rows.size, simhash.SIGNATURE_BITS), dtype=np.float32)
-            slot_of = {ids[int(row)]: slot for slot, row in enumerate(rows)}
-            for chunk in range(0, rows.size, _CHUNK_ROWS):
-                wanted = [ids[int(row)] for row in rows[chunk:chunk + _CHUNK_ROWS]]
-                fetch.execute(
-                    "SELECT item_id, embedding FROM embedding WHERE item_id = ANY(%s)",
-                    (wanted,),
-                )
-                for item_id, blob in fetch.fetchall():
-                    vector = np.frombuffer(blob, dtype=np.float32)
-                    if vector.size == simhash.SIGNATURE_BITS:
-                        vectors[slot_of[str(item_id)]] = vector
-            confirmed = simhash.confirm_pairs(
-                vectors[np.searchsorted(rows, left_slice)],
-                vectors[np.searchsorted(rows, right_slice)],
-                left_durations=[duration_of.get(ids[int(row)]) for row in left_slice],
-                right_durations=[duration_of.get(ids[int(row)]) for row in right_slice],
+        for first, second in simhash._iter_group_pairs(
+            order, starts[crowded], sizes[crowded], limit=_CONFIRM_PAIRS
+        ):
+            first = first.astype(np.int64)
+            second = second.astype(np.int64)
+            compatible = simhash.duration_mask_arrays(
+                row_duration[first], row_duration[second]
             )
-            if confirmed.any():
-                kept_left.append(left_slice[confirmed])
-                kept_right.append(right_slice[confirmed])
-            vectors = None
+            if not compatible.any():
+                continue
+            pending_first.append(first[compatible])
+            pending_second.append(second[compatible])
+            pending += int(compatible.sum())
+            if pending >= _CONFIRM_PAIRS:
+                _flush()
+        _flush()
     finally:
         fetch.close()
     if not kept_left:
-        empty = np.empty(0, dtype=np.int64)
         return empty, empty
-    return np.concatenate(kept_left), np.concatenate(kept_right)
+    left = np.concatenate(kept_left)
+    right = np.concatenate(kept_right)
+    return np.minimum(left, right), np.maximum(left, right)
+
+
+def _folders_for_rows(cur, ids, left, right, count):
+    """Folder key per row for the rows that appear in a candidate pair, else None.
+
+    Feeds merge_pairs so the folder rule is applied WHILE the groups are built:
+    two distinct files in one folder never land in the same group, so no
+    same-folder merge is ever formed (no wrong id to unmap later). Legacy rows
+    carry score.file_path; a row without one (e.g. an already-canonical target)
+    is left unconstrained.
+    """
+    folders = [None] * count
+    if left.size == 0:
+        return folders
+    involved = sorted({int(row) for row in np.concatenate((left, right))})
+    path_of = {}
+    wanted = list({ids[row] for row in involved})
+    for begin in range(0, len(wanted), _CHUNK_ROWS):
+        chunk = wanted[begin:begin + _CHUNK_ROWS]
+        cur.execute(
+            "SELECT item_id, file_path FROM score "
+            "WHERE file_path IS NOT NULL AND item_id = ANY(%s)",
+            (chunk,),
+        )
+        for item_id, file_path in cur.fetchall():
+            path_of[str(item_id)] = file_path
+    for row in involved:
+        folders[row] = simhash.folder_key(path_of.get(ids[row]))
+    return folders
 
 
 def _build_mapping(cur, source_id):
@@ -306,8 +425,8 @@ def _build_mapping(cur, source_id):
     head_len = simhash.CANONICAL_ID_LEN
     cur.execute(
         "SELECT COUNT(*) FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
-        "WHERE e.embedding IS NOT NULL AND " + _LEGACY_ROW_SQL,
+        "LEFT JOIN embedding e ON e.item_id = s.item_id "
+        "WHERE " + _LEGACY_ROW_SQL,
         (head_len,),
     )
     total = cur.fetchone()[0]
@@ -353,8 +472,8 @@ def _build_mapping(cur, source_id):
     legacy_loaded = _hash_catalogue(
         cur,
         "SELECT s.item_id, e.embedding FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
-        "WHERE e.embedding IS NOT NULL AND " + _LEGACY_ROW_SQL,
+        "LEFT JOIN embedding e ON e.item_id = s.item_id "
+        "WHERE " + _LEGACY_ROW_SQL,
         (head_len,), ids, packed, valid, canonical_loaded,
     )
     loaded = canonical_loaded + legacy_loaded
@@ -377,20 +496,9 @@ def _build_mapping(cur, source_id):
 
     resolved_at = time.monotonic()
 
-    def _band_progress(band, bands, candidates, survivors):
-        logger.info(
-            "Legacy catalogue migration: signature blocking, band %d/%d "
-            "(%d candidate pairs examined, %d within tolerance, %.0fs elapsed).",
-            band, bands, candidates, survivors, time.monotonic() - resolved_at,
-        )
-
-    left, right = simhash.near_duplicate_pairs(packed, valid, progress=_band_progress)
-    duration_of = {}
-    if left.size:
-        duration_of = _durations_for_rows(
-            cur, ids, np.concatenate((left, right)), provider_durations, source_id
-        )
-    left, right = _confirm_candidates(cur, ids, left, right, duration_of)
+    left, right = _ivf_candidate_pairs(
+        cur, ids, valid, loaded, provider_durations, source_id
+    )
     # A canonical row may only ever be a merge TARGET, never a child. merge_pairs
     # refuses a merge whose target has itself already merged, so a confirmed
     # canonical-vs-canonical pair (which the emit loop below discards anyway, since
@@ -399,16 +507,36 @@ def _build_mapping(cur, source_id):
     # would then mint a THIRD id for the same audio.
     keep = right >= canonical_loaded
     left, right = left[keep], right[keep]
-    parent = simhash.merge_pairs(loaded, packed, left, right)
+    # Fold the folder rule INTO the id calculation: merge_pairs will not put two
+    # distinct files from one folder in the same group, so a same-folder merge is
+    # never formed here (no wrong id to unmap in a second pass).
+    folders = _folders_for_rows(cur, ids, left, right, loaded)
+    parent = simhash.merge_pairs(loaded, packed, left, right, folders=folders)
 
     mapping = {}
     duplicate_mapping = {}
     canonical_of = dict(enumerate(ids[:canonical_loaded]))
     taken = set(ids[:canonical_loaded])
+    unsignable_ids = [
+        ids[row] for row in range(canonical_loaded, loaded) if not valid[row]
+    ]
+    unsignable_provider_of = (
+        _default_provider_ids(cur, source_id, unsignable_ids)
+        if unsignable_ids else {}
+    )
+    unsignable = 0
     for row in range(canonical_loaded, loaded):
-        if not valid[row]:
-            continue
         legacy_id = ids[row]
+        if not valid[row]:
+            minted = simhash.unsignable_canonical_id(
+                source_id, unsignable_provider_of.get(legacy_id, legacy_id)
+            )
+            while minted in taken:
+                minted = simhash.unsignable_canonical_id(source_id, minted)
+            taken.add(minted)
+            mapping[legacy_id] = minted
+            unsignable += 1
+            continue
         target = int(parent[row])
         if target != row:
             duplicate_mapping[legacy_id] = canonical_of[target]
@@ -417,6 +545,13 @@ def _build_mapping(cur, source_id):
         canonical_of[row] = minted
         taken.add(minted)
         mapping[legacy_id] = minted
+    if unsignable:
+        logger.warning(
+            "Legacy catalogue migration: %d track(s) have no usable embedding "
+            "signature (constant or non-finite embedding); catalogued under "
+            "server-scoped fp_0 ids, excluded from duplicate matching.",
+            unsignable,
+        )
     logger.info(
         "Legacy catalogue migration: resolved %d tracks in %.1fs "
         "(%d new content ids, %d duplicates merged).",
@@ -571,12 +706,14 @@ def _copy_track_server_map(cur, source_id, all_changes, default_provider_ids,
         provider_id = str(default_provider_ids.get(str(old_id), str(old_id)))
         path = legacy_paths.get(str(old_id))
         duration = provider_durations.get(provider_id)
+        tier = 'analysis' if simhash.is_unsignable_id(canonical) else 'default'
         buffer.write(
-            "%s\t%s\t%s\t%s\t%s\n"
+            "%s\t%s\t%s\t%s\t%s\t%s\n"
             % (
                 canonical.replace('\t', ' '),
                 source_id,
                 _copy_escape(provider_id),
+                tier,
                 r'\N' if not path else _copy_escape(path),
                 r'\N' if duration is None else repr(float(duration)),
             )
@@ -584,22 +721,24 @@ def _copy_track_server_map(cur, source_id, all_changes, default_provider_ids,
     buffer.seek(0)
     cur.execute(
         "CREATE TEMP TABLE incoming_default_map "
-        "(item_id TEXT, server_id TEXT, provider_track_id TEXT, file_path TEXT, "
-        "duration DOUBLE PRECISION) "
+        "(item_id TEXT, server_id TEXT, provider_track_id TEXT, match_tier TEXT, "
+        "file_path TEXT, duration DOUBLE PRECISION) "
         "ON COMMIT DROP"
     )
     cur.copy_expert(
         "COPY incoming_default_map "
-        "(item_id, server_id, provider_track_id, file_path, duration) "
+        "(item_id, server_id, provider_track_id, match_tier, file_path, duration) "
         "FROM STDIN",
         buffer,
     )
     cur.execute(
         "INSERT INTO track_server_map "
         "(item_id, server_id, provider_track_id, match_tier, file_path, updated_at) "
-        "SELECT item_id, server_id, provider_track_id, 'default', file_path, now() "
+        "SELECT item_id, server_id, provider_track_id, match_tier, file_path, now() "
         "FROM incoming_default_map "
         "ON CONFLICT (server_id, provider_track_id) DO UPDATE SET "
+        "match_tier = CASE WHEN EXCLUDED.match_tier = 'analysis' "
+        "THEN EXCLUDED.match_tier ELSE track_server_map.match_tier END, "
         "file_path = COALESCE(EXCLUDED.file_path, track_server_map.file_path)"
     )
     cur.execute(
@@ -699,8 +838,11 @@ def relabel_scheme_to_current(cur, only_with_duration=True):
     """Bump every older-version content id (fp_2) up to the current scheme (fp_3).
 
     A pure key rewrite - the signature body is unchanged, only the version digit -
-    so there is no re-hashing, no re-clustering and no id collision (fp_3 can never
-    equal an fp_2). Reuses the same drop-FK / single UPDATE / repoint-index path the
+    so there is no re-hashing and no re-clustering. A bumped fp_2 can still land on
+    an fp_3 that already exists (the duration veto keeps two same-signature rows
+    apart), so each target is minted through mint_canonical_id and steps to the next
+    free id instead of colliding on score_pkey. Reuses the same drop-FK / single
+    UPDATE / repoint-index path the
     provider relabel uses. ``only_with_duration`` bumps rows that already carry a
     length PLUS orphaned old-scheme rows no server maps: a server the backfill merely
     skipped keeps its old id and retries next boot, but an orphan (no track_server_map
@@ -721,7 +863,14 @@ def relabel_scheme_to_current(cur, only_with_duration=True):
     old_ids = [row[0] for row in cur.fetchall()]
     if not old_ids:
         return 0
-    mapping = {old: simhash.to_current_scheme_id(old) for old in old_ids}
+    cur.execute("SELECT item_id FROM score")
+    taken = {row[0] for row in cur.fetchall()}
+    taken.difference_update(old_ids)
+    mapping = {}
+    for old in old_ids:
+        new = simhash.mint_canonical_id(simhash.signature_from_canonical_id(old), taken)
+        taken.add(new)
+        mapping[old] = new
 
     fk_embedding = find_fk(cur, 'embedding', 'item_id') or 'embedding_item_id_fkey'
     fk_clap = find_fk(cur, 'clap_embedding', 'item_id') or 'clap_embedding_item_id_fkey'
@@ -884,7 +1033,7 @@ def canonicalize_fingerprinted_ids(conn=None, log_fn=None, source_server_id=None
         # racing the same key rewrite and DDL through the FK drop/re-add.
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (_RELABEL_ADVISORY_LOCK,))
         source_id = source_server_id or registry.get_default_server_id(db)
-        if source_id is None:
+        if not source_id:
             logger.warning(
                 "Canonicalization skipped: no default server row exists to preserve the "
                 "provider ids; relabelling now would lose them"

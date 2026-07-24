@@ -77,3 +77,4 @@ analysis.md
 .claude/settings.local.json
 lyrics_model_gte_vnni.tar.gz
 native-build/windows/vendor/redis/amd64/redis-server.exe
+.claude/settings.json
