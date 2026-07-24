@@ -501,3 +501,83 @@ class TestChromaprintCleanup:
         db.commit()
         # The group is now unmapped, so it is no longer a duplicate group to check.
         assert dr.split_chromaprint_false_merges(conn=db) == {'split': 0, 'removed': 0}
+
+
+class TestOrphanPurge:
+    def test_orphans_are_deleted_mapped_rows_and_chromaprints_survive(self, db):
+        from tasks import duplicate_repair as dr
+
+        mapped = _fp_id('m')
+        orphan1 = _fp_id('o')
+        orphan2 = _fp_id('p')
+        with db.cursor() as cur:
+            _seed_group(cur, mapped, ['pm'])
+            for orphan in (orphan1, orphan2):
+                cur.execute(
+                    "INSERT INTO score (item_id, title) VALUES (%s, %s)",
+                    (orphan, orphan),
+                )
+                cur.execute(
+                    "INSERT INTO embedding (item_id, embedding) VALUES (%s, %s)",
+                    (orphan, b'\x00\x00'),
+                )
+            cur.execute(
+                "INSERT INTO chromaprint (server_id, provider_track_id, fingerprint) "
+                "VALUES ('srv', 'porphan', %s)",
+                (b'\x01\x02',),
+            )
+        db.commit()
+
+        result = dr.purge_orphan_catalogue_rows(conn=db)
+        db.commit()
+
+        assert result == {'purged': 2}
+        with db.cursor() as cur:
+            cur.execute("SELECT item_id FROM score ORDER BY item_id")
+            assert [row[0] for row in cur.fetchall()] == [mapped], (
+                "only the row bound to no server is deleted"
+            )
+            cur.execute("SELECT count(*) FROM embedding")
+            assert cur.fetchone()[0] == 1, "orphan embeddings cascade away"
+            cur.execute("SELECT count(*) FROM chromaprint")
+            assert cur.fetchone()[0] == 1, "per-file Chromaprints are kept for reuse"
+
+        assert dr.purge_orphan_catalogue_rows(conn=db) == {'purged': 0}, (
+            "a second run finds nothing to purge"
+        )
+
+    def test_path_b_false_merge_orphan_is_cleared_by_the_migration_purge(
+        self, db, monkeypatch
+    ):
+        from tasks import duplicate_repair as dr
+
+        real = _fp_id('a')
+        false = _fp_id('b')
+        with db.cursor() as cur:
+            _seed_group(cur, real, ['pr1', 'pr2'])
+            _seed_group(cur, false, ['pf1', 'pf2'])
+        db.commit()
+
+        _run(db, monkeypatch, {'pr1': 200.0, 'pr2': 201.0, 'pf1': 120.0, 'pf2': 240.0})
+        db.commit()
+
+        def _orphans():
+            with db.cursor() as cur:
+                cur.execute(
+                    "SELECT count(*) FROM score s WHERE NOT EXISTS "
+                    "(SELECT 1 FROM track_server_map t WHERE t.item_id = s.item_id)"
+                )
+                return cur.fetchone()[0]
+
+        assert _orphans() == 1, "Path B unmaps the false merge, leaving it an orphan"
+
+        result = dr.purge_orphan_catalogue_rows(conn=db)
+        db.commit()
+
+        assert result == {'purged': 1}
+        assert _orphans() == 0, "the migration purge leaves no orphan"
+        with db.cursor() as cur:
+            cur.execute("SELECT count(*) FROM score")
+            assert cur.fetchone()[0] == 1, "only the real duplicate survives"
+            cur.execute("SELECT count(*) FROM embedding")
+            assert cur.fetchone()[0] == 1, "the orphan's embedding cascaded away"

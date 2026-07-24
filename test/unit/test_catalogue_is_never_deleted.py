@@ -16,17 +16,21 @@ catalogue, and is hidden from that server's results by the availability filter; 
 later sweep re-binds it with no re-analysis. Removing a server or migrating
 providers change only `track_server_map`.
 
-Two deleters are sanctioned, and both only remove a row whose audio is gone from
+Three deleters are sanctioned, and each only removes a row whose audio is gone from
 every library or already preserved elsewhere:
 * the fingerprint canonicalizer's duplicate MERGE, which folds a row into the
   canonical row that already holds the same audio's analysis (nothing lost);
 * the cleaning pass, which deletes a row bound to NO server (an orphan) - the file
   is gone from every library, so the analysis is re-created if it ever returns -
   and only when every server was read completely, so an incomplete view can never
-  delete a track still on a server.
+  delete a track still on a server;
+* the migration orphan purge, which runs only after a migration and deletes only
+  rows bound to NO server (false-merge splits plus pre-existing orphans), so the
+  catalogue is left clean and each deleted track re-analyzes under its own id.
 
 Main Features:
-* Only the canonicalizer merge and the cleaning orphan-delete may DELETE FROM score
+* Only the canonicalizer merge, the cleaning orphan-delete and the migration orphan
+  purge may DELETE FROM score
 * embedding / clap_embedding / lyrics_embedding cascade from score, so they are
   covered by the same rule
 """
@@ -44,11 +48,13 @@ _SKIP_DIRS = {
 }
 
 # The sanctioned deleters: the canonicalizer's duplicate merge (deletes a row only
-# after folding it into the canonical row for the same audio), and the cleaning pass
-# (deletes only orphans bound to no server, and only on a complete server view).
+# after folding it into the canonical row for the same audio), the cleaning pass
+# (deletes only orphans bound to no server, and only on a complete server view), and
+# the migration orphan purge (deletes only rows bound to no server, migration-only).
 _SANCTIONED = {
     'tasks/fingerprint_canonicalize.py': 'duplicate merge into the canonical row',
     'tasks/cleaning.py': 'orphan delete: tracks bound to no server, complete view only',
+    'tasks/duplicate_repair.py': 'migration orphan purge: rows bound to no server',
 }
 
 _DELETE_SCORE = re.compile(r'DELETE\s+FROM\s+score\b', re.IGNORECASE)
