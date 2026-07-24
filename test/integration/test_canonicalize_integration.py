@@ -538,6 +538,47 @@ class TestRealCanonicalization:
             "the fp_0 row never re-triggers the migration"
         )
 
+    def test_no_corruption_shape_of_the_embedding_can_brick_the_migration(self, db):
+        from tasks import fingerprint_canonicalize as fc
+
+        tracks = [
+            ('jf-missing', '/music/A/01.flac', _distinct_embedding(1)),
+            ('jf-null', '/music/B/02.flac', _distinct_embedding(2)),
+            ('jf-truncated', '/music/C/03.flac', _distinct_embedding(3)),
+            ('jf-wrong-size', '/music/D/04.flac', _distinct_embedding(4)),
+            ('jf-ok', '/music/E/05.flac', _distinct_embedding(5)),
+        ]
+        _build(db, tracks)
+        with db.cursor() as cur:
+            cur.execute("DELETE FROM embedding WHERE item_id = 'jf-missing'")
+            cur.execute("UPDATE embedding SET embedding = NULL WHERE item_id = 'jf-null'")
+            cur.execute(
+                "UPDATE embedding SET embedding = %s WHERE item_id = 'jf-truncated'",
+                (psycopg2.Binary(b'\x00\x01\x02'),),
+            )
+            cur.execute(
+                "UPDATE embedding SET embedding = %s WHERE item_id = 'jf-wrong-size'",
+                (psycopg2.Binary(np.zeros(10, dtype=np.float32).tobytes()),),
+            )
+        db.commit()
+
+        result = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+
+        assert result['relabelled'] == 5, "every corruption shape still relabels"
+        maps = {p: item for p, item, _f in _maps(db)}
+        for provider in ('jf-missing', 'jf-null', 'jf-truncated', 'jf-wrong-size'):
+            assert maps[provider] == simhash.unsignable_canonical_id('srv', provider)
+        assert maps['jf-ok'].startswith(simhash.CURRENT_ID_HEAD)
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT count(*) FROM track_server_map WHERE match_tier = 'analysis'"
+            )
+            assert cur.fetchone()[0] == 4
+        second = fc.canonicalize_fingerprinted_ids(conn=db, source_server_id='srv')
+        assert second == {'relabelled': 0, 'duplicates': 0}, (
+            "no corruption shape leaves a legacy id behind to re-run the migration"
+        )
+
     def test_unsignable_fp0_uses_the_source_servers_provider_id_when_mapped(self, db):
         from tasks import fingerprint_canonicalize as fc
 

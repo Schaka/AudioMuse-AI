@@ -32,9 +32,11 @@ the source server (no audio downloads) and are backfilled into
 score.duration; if the server is unreachable the migration still runs and
 simply merges nothing, which is always safe (an absent IVF index does the
 same, and a track the index does not cover keeps its own id). The source server's real ids
-are preserved in track_server_map so output can be translated back; rows
-without an embedding keep their provider id and keep working via the
-identity translation fallback.
+are preserved in track_server_map so output can be translated back; a row
+whose embedding is missing or unusable (NULL, truncated, wrong size, constant,
+non-finite) is relabelled to the server-scoped fp_0 unsignable id and mapped
+with the 'analysis' tier, so no corruption shape can leave a legacy id behind
+to fail the verifier and re-run the migration forever.
 
 Main Features:
 * One-time, idempotent startup relabel of legacy rows. Content ids are hashed
@@ -135,10 +137,10 @@ def _hash_catalogue(cur, sql, params, ids, packed, valid, offset):
             batch = np.zeros((len(rows), simhash.SIGNATURE_BITS), dtype=np.float32)
             kept = 0
             for item_id, blob in rows:
-                vector = np.frombuffer(blob, dtype=np.float32)
-                if vector.size != simhash.SIGNATURE_BITS:
-                    continue
-                batch[kept] = vector
+                if blob is not None and len(blob) % 4 == 0:
+                    vector = np.frombuffer(blob, dtype=np.float32)
+                    if vector.size == simhash.SIGNATURE_BITS:
+                        batch[kept] = vector
                 ids.append(str(item_id))
                 kept += 1
             if not kept:
@@ -423,8 +425,8 @@ def _build_mapping(cur, source_id):
     head_len = simhash.CANONICAL_ID_LEN
     cur.execute(
         "SELECT COUNT(*) FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
-        "WHERE e.embedding IS NOT NULL AND " + _LEGACY_ROW_SQL,
+        "LEFT JOIN embedding e ON e.item_id = s.item_id "
+        "WHERE " + _LEGACY_ROW_SQL,
         (head_len,),
     )
     total = cur.fetchone()[0]
@@ -470,8 +472,8 @@ def _build_mapping(cur, source_id):
     legacy_loaded = _hash_catalogue(
         cur,
         "SELECT s.item_id, e.embedding FROM score s "
-        "JOIN embedding e ON e.item_id = s.item_id "
-        "WHERE e.embedding IS NOT NULL AND " + _LEGACY_ROW_SQL,
+        "LEFT JOIN embedding e ON e.item_id = s.item_id "
+        "WHERE " + _LEGACY_ROW_SQL,
         (head_len,), ids, packed, valid, canonical_loaded,
     )
     loaded = canonical_loaded + legacy_loaded
@@ -526,9 +528,13 @@ def _build_mapping(cur, source_id):
     for row in range(canonical_loaded, loaded):
         legacy_id = ids[row]
         if not valid[row]:
-            mapping[legacy_id] = simhash.unsignable_canonical_id(
+            minted = simhash.unsignable_canonical_id(
                 source_id, unsignable_provider_of.get(legacy_id, legacy_id)
             )
+            while minted in taken:
+                minted = simhash.unsignable_canonical_id(source_id, minted)
+            taken.add(minted)
+            mapping[legacy_id] = minted
             unsignable += 1
             continue
         target = int(parent[row])
